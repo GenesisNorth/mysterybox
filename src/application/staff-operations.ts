@@ -40,6 +40,11 @@ export interface DeliveryDetails {
   city: string;
   region: string | null;
   deliveryNotes: string | null;
+  /** Who the courier hands the box to. Omitted (or null) on a staff update keeps the stored value. */
+  contactName?: string | null;
+  contactPhone?: string | null;
+  /** "giver" = deliver to the buyer, who hands it over; "recipient" = deliver straight to the next person. */
+  deliveryTo?: "giver" | "recipient" | null;
 }
 export interface PrivateParticipant {
   firstName: string | null;
@@ -227,7 +232,10 @@ export class StaffOperations {
       addressLine2: optional(input.addressLine2, "Address line 2", 160),
       city: required(input.city, "City", 80),
       region: optional(input.region, "Region", 80),
-      deliveryNotes: optional(input.deliveryNotes, "Delivery notes", 500)
+      deliveryNotes: optional(input.deliveryNotes, "Delivery notes", 500),
+      contactName: optional(input.contactName ?? null, "Contact name", 80),
+      contactPhone: (() => { const phone = optional(input.contactPhone ?? null, "Contact phone", 30); if (phone && !/^[0-9+() -]{7,30}$/.test(phone)) throw new Error("Contact phone is not valid"); return phone; })(),
+      deliveryTo: input.deliveryTo ?? null
     };
   }
 

@@ -4,7 +4,11 @@ import { publicLabel, type ParticipantDisplay } from "../domain/public-trail.js"
 /** Position 1 is the trail's starter (giver of the root box); the recipient of a box at depth d is at d + 2. */
 export interface TrailMember { position: number; participant: ParticipantDisplay; }
 /** `members` holds only this box's own lineage (starter and ancestor recipients), never other branches or later people. */
-export interface RecipientBox extends Box { cardToken: string; giver: ParticipantDisplay | null; giverNote: string | null; members: TrailMember[]; }
+/**
+ * `giverName` is the name a pass-forward giver typed at checkout for this recipient to see; it takes precedence over
+ * the consent-based `giver` label used for staff-created boxes.
+ */
+export interface RecipientBox extends Box { cardToken: string; giver: ParticipantDisplay | null; giverName: string | null; giverNote: string | null; members: TrailMember[]; }
 export interface RecipientProfile { firstName: string | null; lastInitial: string | null; area: string | null; displayConsent: boolean; }
 export interface RecipientJourneyRepository {
   findByCardToken(cardToken: string): Promise<RecipientBox | null>;
@@ -35,7 +39,7 @@ export class RecipientJourney {
     if (box.recipientStatus === "unknown" || box.recipientStatus === "scanned") return { kind: "confirm-receipt", boxNumber: box.boxNumber };
     const trail = [...box.members].sort((a, b) => a.position - b.position).map((member) => publicLabel(member.participant));
     if (!await this.holdsBox(box.id, holderSession)) return { kind: "read-only", boxNumber: box.boxNumber, trail };
-    return { kind: "reveal", boxNumber: box.boxNumber, giver: box.giver ? publicLabel(box.giver) : "Someone who cares", note: box.giverNote, trail, position: box.depth + 2 };
+    return { kind: "reveal", boxNumber: box.boxNumber, giver: box.giverName ?? (box.giver ? publicLabel(box.giver) : "Someone who cares"), note: box.giverNote, trail, position: box.depth + 2 };
   }
 
   /** The first device to confirm a delivered box becomes its only holder; a holder confirming again changes nothing. */

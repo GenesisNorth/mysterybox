@@ -1,11 +1,12 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { RecipientJourney, type BoxPage, type RecipientJourneyRepository } from "./application/recipient-journey.js";
-import { MyStories, type MyStoriesRepository, type StorySummary } from "./application/my-stories.js";
-import { PassItForward, type PassItForwardRepository } from "./application/pass-it-forward.js";
+import { RecipientJourney, type RecipientJourneyRepository } from "./application/recipient-journey.js";
+import { MyStories, type MyStoriesRepository } from "./application/my-stories.js";
+import { CheckoutValidationError, PassItForward, type PassItForwardRepository } from "./application/pass-it-forward.js";
 import { PaymentConfirmation } from "./application/payment-confirmation.js";
-import { GiverTracker, type GiverTrackerRepository, type GiverTrackerPage } from "./application/giver-tracker.js";
+import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
+import { checkoutHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindersHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "./infrastructure/in-memory-recipient-journey.js";
 import { postgresRecipientJourneyRepository } from "./infrastructure/postgres-recipient-journey.js";
 import { PaystackGateway } from "./infrastructure/paystack.js";
@@ -17,7 +18,10 @@ const passOnAmountKobo = Number(process.env.PASS_ON_AMOUNT_KOBO);
 const postgresRepository = process.env.DATABASE_URL
   ? postgresRecipientJourneyRepository(process.env.DATABASE_URL, passOnAmountKobo)
   : null;
-const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository = postgresRepository ?? new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
+const demoRepository = postgresRepository ? null : new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
+const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository = postgresRepository ?? demoRepository!;
+/** The payment simulator exists only for the in-memory demo, never with a database or in production. */
+const demoPayments = demoRepository && process.env.NODE_ENV !== "production" ? demoRepository : null;
 const journey = new RecipientJourney(repository);
 const passItForward = new PassItForward(repository);
 const giverTracker = new GiverTracker(repository);
@@ -46,9 +50,9 @@ function cookieValue(request: IncomingMessage, name: string): string | undefined
   return cookie?.slice(prefix.length);
 }
 function holderCookie(request: IncomingMessage): string | undefined { return cookieValue(request, "holder_session"); }
-async function formValues(request: IncomingMessage): Promise<URLSearchParams> {
+async function formValues(request: IncomingMessage, maxLength = 10_000): Promise<URLSearchParams> {
   let body = "";
-  for await (const chunk of request) { body += chunk; if (body.length > 10_000) throw new Error("Request body is too large"); }
+  for await (const chunk of request) { body += chunk; if (body.length > maxLength) throw new Error("Request body is too large"); }
   return new URLSearchParams(body);
 }
 async function formValue(request: IncomingMessage, name: string): Promise<string> {
@@ -79,48 +83,6 @@ function logRoute(pathname: string): string {
   if (/^\/staff\/boxes\//.test(pathname)) return "/staff/boxes/:box";
   return pathname;
 }
-function layout(content: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#1e1639"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>Gratitude Stories</title><style>
-  :root{--ink:#211a3d;--muted:#6d6681;--plum:#5c3f92;--violet:#7e5dcc;--gold:#edb64d;--paper:#fffdf9;--line:#e9e3f3;--shadow:0 24px 64px #211a3d1c;--display:"Avenir Next","Avenir",Montserrat,"Helvetica Neue",Arial,sans-serif;--body:"Avenir Next","Avenir",Inter,"Helvetica Neue",Arial,sans-serif}*{box-sizing:border-box}body{min-height:100vh;margin:0;color:var(--ink);font-family:var(--body);background:radial-gradient(circle at 8% 5%,#f7dba6 0,transparent 24rem),radial-gradient(circle at 95% 20%,#d8caf9 0,transparent 29rem),#f7f4fb}.ambient{position:fixed;z-index:-1;width:22rem;height:22rem;border-radius:50%;filter:blur(22px);opacity:.48;animation:drift 14s ease-in-out infinite}.ambient.one{background:#f5c76e;top:45%;left:-12rem}.ambient.two{background:#c7a9fa;right:-13rem;top:55%;animation-delay:-7s}.page{width:min(100%,640px);margin:0 auto;padding:28px 20px 56px}.brand{display:flex;align-items:center;gap:10px;margin:0 0 44px;font-size:12px;font-weight:800;letter-spacing:.14em;color:#453667;text-transform:uppercase}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:10px;color:#fff;background:linear-gradient(135deg,var(--gold),#d78750);box-shadow:0 8px 18px #d8914f55;font-size:16px}.eyebrow{margin:0 0 12px;color:var(--violet);font-size:11px;font-weight:800;letter-spacing:.14em;line-height:1.3}h1{max-width:12ch;margin:0;font-family:var(--display);font-size:clamp(40px,10vw,62px);font-weight:650;letter-spacing:-.06em;line-height:.98}h2{margin:0 0 10px;font-family:var(--display);font-size:20px;font-weight:650;letter-spacing:-.03em}.card{position:relative;overflow:hidden;margin-top:24px;padding:25px;border:1px solid #fff;background:linear-gradient(145deg,#ffffffec,#fbf9ffcf);border-radius:24px;box-shadow:var(--shadow);animation:rise .65s both}.card:before{position:absolute;top:0;left:25px;width:64px;height:3px;border-radius:999px;background:linear-gradient(90deg,var(--gold),#ffda80);content:""}.card:nth-of-type(2){animation-delay:.1s}.card:nth-of-type(3){animation-delay:.18s}.muted{color:var(--muted);font-size:15px;line-height:1.65}.trail{position:relative;margin:20px 0 4px;padding-left:24px;color:#4d4265;line-height:2.1}.trail:before{position:absolute;top:7px;bottom:7px;left:5px;width:2px;background:linear-gradient(var(--gold),var(--violet));content:""}.trail div{position:relative}.trail div:before{position:absolute;top:13px;left:-23px;width:8px;height:8px;border:2px solid #fff;border-radius:50%;background:var(--gold);box-shadow:0 0 0 2px #f5dfa5;content:""}.trail div:last-child:before{background:var(--violet);box-shadow:0 0 0 3px #e5dafb}button{width:100%;min-height:54px;margin-top:12px;padding:14px 18px;border:0;border-radius:16px;color:#fff;background:linear-gradient(135deg,var(--plum),var(--violet));box-shadow:0 12px 23px #60439544;font:700 15px inherit;letter-spacing:.01em;cursor:pointer;transition:transform .2s ease,box-shadow .2s ease}button:hover{transform:translateY(-2px);box-shadow:0 16px 28px #60439555}button:active{transform:translateY(0)}form+form button{background:#eee9f5;color:#4a3d61;box-shadow:none}a{color:var(--plum);font-weight:700;text-decoration-color:#cfc0ef;text-underline-offset:3px}label{display:block;margin-top:15px;color:#514766;font-size:13px;font-weight:700}input{width:100%;margin-top:7px;padding:14px 13px;border:1px solid var(--line);border-radius:13px;outline:none;background:#fff;color:var(--ink);font:16px inherit;transition:border-color .2s,box-shadow .2s}input:focus{border-color:var(--violet);box-shadow:0 0 0 4px #dcd0f840}input[type=checkbox]{width:auto;margin-right:8px;accent-color:var(--plum)}label:has(input[type=checkbox]){display:flex;align-items:center;line-height:1.4}.card>p:first-child:not(.eyebrow){margin-top:0}@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}@keyframes drift{50%{transform:translate(20px,-25px) scale(1.08)}}@media (max-width:440px){.page{padding:22px 16px 42px}.brand{margin-bottom:34px}.card{padding:21px;border-radius:21px}h1{font-size:45px}}@media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
-  </style></head><body><span class="ambient one"></span><span class="ambient two"></span><main class="page"><div class="brand"><span class="brand-mark">✦</span> Gratitude Stories</div>${content}</main></body></html>`;
-}
-function homeHtml(): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#120d25"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>Gratitude Stories — Gifts that keep moving</title><style>
-  :root{--ink:#171324;--night:#120d25;--lav:#8666d8;--gold:#f4bf58;--paper:#faf9ff;--muted:#716b80}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Avenir Next","Avenir",Inter,"Helvetica Neue",Arial,sans-serif}.nav{position:absolute;z-index:3;top:0;left:50%;display:flex;align-items:center;justify-content:space-between;width:min(1180px,calc(100% - 40px));padding:25px 0;transform:translateX(-50%);color:#fff}.logo{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.logo i{display:grid;place-items:center;width:31px;height:31px;border-radius:10px;background:linear-gradient(135deg,#f7cf76,#dc9364);font-style:normal}.nav a{color:#fff;text-decoration:none;font-size:14px;font-weight:650}.nav .pill{padding:10px 15px;border:1px solid #ffffff44;border-radius:999px;background:#ffffff18;backdrop-filter:blur(14px)}.hero{position:relative;isolation:isolate;min-height:760px;overflow:hidden;background:radial-gradient(circle at 72% 65%,#56336f 0,transparent 34%),radial-gradient(circle at 3% 10%,#28204c 0,transparent 40%),var(--night)}.hero-inner{display:grid;grid-template-columns:1.04fr .96fr;align-items:center;width:min(1180px,calc(100% - 40px));min-height:760px;margin:auto;padding:110px 0 50px}.hero-copy{position:relative;z-index:2;color:#fff}.kicker{margin-bottom:20px;color:#f5c86d;font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}.hero h1{max-width:680px;margin:0;font-size:clamp(55px,7.1vw,101px);font-weight:650;letter-spacing:-.075em;line-height:.91}.hero h1 em{font-family:ui-serif,Georgia,serif;font-weight:400}.hero p{max-width:490px;margin:28px 0;color:#d9d1ea;font-size:18px;line-height:1.6}.actions{display:flex;flex-wrap:wrap;gap:12px}.cta{display:inline-flex;align-items:center;justify-content:center;min-height:52px;padding:0 21px;border-radius:16px;background:#fff;color:#241a42;font-size:15px;font-weight:750;text-decoration:none;box-shadow:0 14px 34px #0005;transition:.25s}.cta:hover{transform:translateY(-3px)}.cta.alt{border:1px solid #ffffff3d;background:#ffffff14;color:#fff;backdrop-filter:blur(12px)}.product{position:relative;align-self:end;height:620px;animation:float 7s ease-in-out infinite}.product:after{position:absolute;right:-10%;bottom:-3%;z-index:-1;width:90%;height:45%;border-radius:50%;background:#c286ff55;filter:blur(50px);content:""}.product img{position:absolute;right:-8%;bottom:-70px;width:min(560px,58vw);filter:drop-shadow(0 45px 35px #0008);transform:rotate(2deg)}.section{width:min(1120px,calc(100% - 40px));margin:0 auto;padding:120px 0}.eyebrow{color:#7654c1;font-size:12px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}.section h2{max-width:680px;margin:14px 0 0;font-size:clamp(39px,5vw,67px);letter-spacing:-.065em;line-height:.96}.section h2 em{font-family:ui-serif,Georgia,serif;font-weight:400}.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:52px}.step{min-height:245px;padding:28px;border:1px solid #ebe7f4;border-radius:28px;background:#fff;box-shadow:0 14px 36px #26184b0a}.step b{display:grid;place-items:center;width:40px;height:40px;border-radius:50%;background:#f2ebff;color:#6f4ac3;font-size:14px}.step h3{margin:38px 0 9px;font-size:21px;letter-spacing:-.03em}.step p{margin:0;color:var(--muted);line-height:1.55}.quote{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center;padding:84px;border-radius:38px;color:#fff;background:linear-gradient(135deg,#2b2050,#513a7a)}.quote h2{margin:0;font-size:clamp(39px,5vw,64px);letter-spacing:-.065em;line-height:.95}.quote p{margin:0;color:#d9cfed;font-size:17px;line-height:1.65}.footer{padding:40px 20px;color:#837d90;font-size:13px;text-align:center}@keyframes float{50%{transform:translateY(-14px)}}@media(max-width:760px){.nav{width:calc(100% - 32px)}.nav>a:not(.pill){display:none}.hero,.hero-inner{min-height:790px}.hero-inner{display:block;padding-top:150px}.hero h1{font-size:62px}.product{position:absolute;right:0;bottom:0;width:100%;height:390px;opacity:.82}.product img{right:-22%;bottom:-70px;width:470px}.steps{grid-template-columns:1fr}.quote{grid-template-columns:1fr;gap:28px;padding:34px 27px}.section{padding:80px 0}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-  </style></head><body><nav class="nav"><div class="logo"><i>✦</i> Gratitude Stories</div><a href="#how">How it works</a><a class="pill" href="/b/demo-card-token">Open a box</a></nav><section class="hero"><div class="hero-inner"><div class="hero-copy"><div class="kicker">A gift with a second chapter</div><h1>Kindness was made to <em>move.</em></h1><p>Gratitude Stories turns one thoughtful gift into a private trail of people choosing to keep it going.</p><div class="actions"><a class="cta" href="/b/demo-card-token">Experience a box <span>&nbsp;→</span></a><a class="cta alt" href="#how">Discover the idea</a></div></div><div class="product"><img src="/assets/gratitude-gift-hero.png" alt="An elegant gift box glowing from within"></div></div></section><section class="section" id="how"><div class="eyebrow">Designed for the feeling</div><h2>One box. Many <em>beautiful</em> moments.</h2><div class="steps"><article class="step"><b>01</b><h3>Give with intention</h3><p>A considered physical gift arrives with a private story waiting inside.</p></article><article class="step"><b>02</b><h3>Reveal the warmth</h3><p>The recipient opens a consent-safe trail and sees the thought behind it.</p></article><article class="step"><b>03</b><h3>Keep it moving</h3><p>When the moment is right, they can send the feeling forward on the same trail.</p></article></div></section><section class="section"><div class="quote"><h2>Small gestures become <em>shared history.</em></h2><p>No public pressure. No personal details on display. Just a quiet, beautiful way to remember that someone chose you—and perhaps choose someone else in return.</p></div></section><footer class="footer">Made for meaningful moments · Gratitude Stories</footer></body></html>`;
-}
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
-}
-function pageHtml(page: BoxPage, token: string): string {
-  if (page.kind === "not-found") return layout("<h1>We could not find that box.</h1><p class=\"muted\">Please check the card or ask the Gratitude Stories team for help.</p>");
-  if (page.kind === "inactive") return layout("<h1>This box is no longer active.</h1><p class=\"muted\">Please contact the Gratitude Stories team if you need help.</p>");
-  if (page.kind === "in-transit") return layout(`<p class="eyebrow">GRATITUDE STORIES BOX · ${escapeHtml(page.boxNumber)}</p><h1>Your box is on its way.</h1><p class="muted">Someone thought of you. The story opens once it is safely in your hands.</p>`);
-  if (page.kind === "read-only") return layout(`<p class="eyebrow">GRATITUDE STORIES BOX · ${escapeHtml(page.boxNumber)}</p><h1>This box has found its person.</h1><p class="muted">It has already been received. If it was meant for you, please contact the Gratitude Stories team.</p><section class="card"><p class="eyebrow">THE TRAIL SO FAR</p><div class="trail">${page.trail.map(escapeHtml).map((label) => `<div>${label}</div>`).join("")}</div></section>`);
-  if (page.kind === "confirm-receipt") return layout(`<p class="eyebrow">GRATITUDE STORIES BOX · ${escapeHtml(page.boxNumber)}</p><h1>Your box has been delivered.</h1><section class="card"><h2>Have you received it?</h2><p class="muted">Tap yes to open its story: who it is from and the trail it belongs to.</p><form method="post" action="/b/${encodeURIComponent(token)}/confirm"><button>Yes, I have it</button></form><p class="muted">Not yet or need help? Contact us.</p></section>`);
-  return layout(`<p class="eyebrow">GRATITUDE STORIES BOX · ${escapeHtml(page.boxNumber)}</p><h1>Someone thought of you.</h1><p class="muted">This box was passed to you by ${escapeHtml(page.giver)}.</p><section class="card"><p class="eyebrow">A NOTE FOR YOU</p><p>${page.note ? escapeHtml(page.note) : "A gift was chosen for you."}</p></section><section class="card"><p class="eyebrow">THE TRAIL SO FAR</p><h2>You are person ${page.position} on this trail.</h2><div class="trail">${page.trail.map(escapeHtml).map((label) => `<div>${label}</div>`).join("")}<div><strong>You</strong></div></div><p class="muted"><a href="/b/${encodeURIComponent(token)}/profile">Choose how you appear on the trail</a> · <a href="/b/${encodeURIComponent(token)}/reminders">Reminder preferences</a> · <a href="/b/${encodeURIComponent(token)}/save-story">Save my story</a></p></section><section class="card"><h2>Will you pass it forward?</h2><p class="muted">Choosing is always yours. Your next box will stay on this same trail.</p><form method="post" action="/b/${encodeURIComponent(token)}/pass"><button>Yes, I’ll pass it forward</button></form><form method="post" action="/b/${encodeURIComponent(token)}/decline" style="margin-top:12px"><button style="background:#6d5b60">Not now</button></form></section>`);
-}
-function profileHtml(): string {
-  return layout(`<p class="eyebrow">YOUR TRAIL PROFILE</p><h1>How should the trail remember you?</h1><section class="card"><p class="muted">This is optional. If you consent, only your first name, last initial, and area will appear to future recipients. Contact details are never shown.</p><form method="post"><label><input type="checkbox" name="displayConsent" value="yes"> I’m happy to appear on the private trail</label><label for="firstName">First name</label><input id="firstName" name="firstName" maxlength="40" autocomplete="given-name" style="box-sizing:border-box;width:100%;margin:8px 0 16px;padding:12px;border:1px solid #eadac4;border-radius:8px"><label for="lastInitial">Last initial</label><input id="lastInitial" name="lastInitial" maxlength="1" style="box-sizing:border-box;width:100%;margin:8px 0 16px;padding:12px;border:1px solid #eadac4;border-radius:8px"><label for="area">Area</label><input id="area" name="area" maxlength="80" style="box-sizing:border-box;width:100%;margin:8px 0 16px;padding:12px;border:1px solid #eadac4;border-radius:8px"><button>Save my choice</button></form></section>`);
-}
-function saveStoryHtml(message?: string): string { return layout(`<p class="eyebrow">MY STORIES</p><h1>Keep this story close.</h1><section class="card"><p class="muted">Save this box to a private, passwordless profile. We’ll send a secure sign-in link—no password required.</p>${message ?? ""}<form method="post"><label for="email">Your email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com"><button>Save my story</button></form></section>`); }
-function storiesHtml(stories: StorySummary[]): string { const cards=stories.length?stories.map(s=>`<section class="card"><p class="eyebrow">${escapeHtml(s.fulfilmentStatus)}</p><h2>${escapeHtml(s.boxNumber)}</h2><p class="muted">Your place in this story is safely saved.</p></section>`).join(""):"<section class=\"card\"><p class=\"muted\">No saved stories yet.</p></section>"; return layout(`<p class="eyebrow">MY STORIES</p><h1>Your moments, kept private.</h1>${cards}`); }
-function remindersHtml(emailOptIn: boolean): string { return layout(`<p class="eyebrow">REMINDERS</p><h1>Keep in touch?</h1><section class="card"><p class="muted">Choose whether we may email a one-time reminder about this box. You can change this choice anytime.</p><form method="post"><label><input type="checkbox" name="emailOptIn" value="yes"${emailOptIn ? " checked" : ""}> Email me a reminder</label><button>Save my choice</button></form></section>`); }
-function checkoutHtml(state: "ready" | "invalid" | "pending", reference?: string, trackerToken?: string | null): string {
-  if (state === "invalid") return layout("<h1>This checkout link has expired.</h1><p class=\"muted\">Return to your box page to start again.</p>");
-  if (state === "pending") return layout(`<p class="eyebrow">GRATITUDE STORIES</p><h1>Your next box is reserved.</h1><section class="card"><p class="muted">Order ${escapeHtml(reference ?? "")}</p><p>Payment connection is the next step. This order is safely tied to the trail; a new box does not exist until payment is verified.</p>${trackerToken ? `<p><a href="/t/${encodeURIComponent(trackerToken)}">Track this box privately</a></p>` : ""}</section>`);
-  return layout("<p class=\"eyebrow\">GRATITUDE STORIES</p><h1>Keep the kindness moving.</h1><section class=\"card\"><p class=\"muted\">Your next box will be connected to the same private trail. We will use this email only for this order.</p><form method=\"post\" action=\"/checkout\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" required autocomplete=\"email\" style=\"box-sizing:border-box;width:100%;margin:8px 0 16px;padding:12px;border:1px solid #eadac4;border-radius:8px\"><button>Reserve my next box</button></form></section>");
-}
-function paymentCompleteHtml(trackerToken: string | undefined): string {
-  const tracker = trackerToken ? `<p><a href="/t/${encodeURIComponent(trackerToken)}">Track this box privately</a></p>` : "";
-  return layout(`<p class="eyebrow">GRATITUDE STORIES</p><h1>Thank you.</h1><section class="card"><p class="muted">Your payment is being confirmed. Your box is created only after secure payment verification.</p>${tracker}</section>`);
-}
-function trackerHtml(page: GiverTrackerPage): string {
-  if (page.kind === "not-found") return layout("<h1>We could not find that tracker.</h1><p class=\"muted\">Please check your private tracking link.</p>");
-  const steps = page.steps.map((step) => `<li><strong>${escapeHtml(step.label)}</strong> — ${step.complete ? "Done" : step.current ? "In progress" : "Not yet"}</li>`).join("");
-  return layout(`<p class="eyebrow">PRIVATE BOX TRACKER</p><h1>You kept it moving.</h1><section class="card"><p class="muted">Order ${escapeHtml(page.orderReference)}</p><ol class="muted">${steps}</ol><p>${page.complete ? "Delivered. Your part is complete." : "This tracker ends at delivery to protect the recipient’s privacy."}</p></section>`);
-}
-
 const server = createServer(async (request, response) => {
   const requestId = randomUUID();
   response.setHeader("x-request-id", requestId);
@@ -314,21 +276,38 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET") {
       const page = await passItForward.checkoutPage(referralToken);
       response.writeHead(page.kind === "ready" ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
-      response.end(checkoutHtml(page.kind === "ready" ? "ready" : "invalid"));
+      response.end(checkoutHtml(page.kind === "ready" ? { kind: "ready" } : { kind: "invalid" }));
       return;
     }
     if (request.method === "POST") {
+      let values: Record<string, string> = {};
       try {
-        const email = await formValue(request, "email");
-        const order = await passItForward.createOrder(referralToken, email);
+        // Large enough for two 500-character free-text fields written in non-Latin scripts once URL-encoded.
+        values = Object.fromEntries(await formValues(request, 40_000));
+        const field = (name: string) => values[name] ?? "";
+        const order = await passItForward.createOrder(referralToken, {
+          email: field("email"), giverName: field("giverName"), note: field("note"), deliveryTo: field("deliveryTo"),
+          deliveryName: field("deliveryName"), deliveryPhone: field("deliveryPhone"), addressLine1: field("addressLine1"), addressLine2: field("addressLine2"),
+          city: field("city"), region: field("region"), deliveryNotes: field("deliveryNotes")
+        });
         if (paystack && postgresRepository && paystackCallbackUrl) {
-          const checkout = await paystack.initialize({ reference: order.paymentReference, email: email.trim().toLowerCase(), amountKobo: passOnAmountKobo, callbackUrl: paystackCallbackUrl });
+          const checkout = await paystack.initialize({ reference: order.paymentReference, email: order.details.customerEmail, amountKobo: passOnAmountKobo, callbackUrl: paystackCallbackUrl });
           response.writeHead(303, { location: checkout.authorizationUrl, "set-cookie": order.trackerToken ? `giver_tracker=${order.trackerToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/checkout; Max-Age=2592000` : undefined }); response.end(); return;
         }
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml("pending", order.reference, order.trackerToken));
-      } catch { response.writeHead(404, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml("invalid")); }
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "pending", reference: order.reference, trackerToken: order.trackerToken, demoPayment: Boolean(demoPayments) }));
+      } catch (error) {
+        if (error instanceof CheckoutValidationError) { response.writeHead(422, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "ready", error: error.message, values })); }
+        else { response.writeHead(404, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "invalid" })); }
+      }
       return;
     }
+  }
+  if (pathname === "/demo/pay" && request.method === "POST" && demoPayments) {
+    try {
+      const { cardToken } = await demoPayments.simulatePaidAndDelivered(await formValue(request, "reference"));
+      response.writeHead(303, { location: `/b/${encodeURIComponent(cardToken)}` }); response.end();
+    } catch { response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }); response.end("Demo order not found"); }
+    return;
   }
   const profileMatch = pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/profile$/);
   if (profileMatch?.[1]) {

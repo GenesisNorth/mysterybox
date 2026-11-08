@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RecipientBox, RecipientJourneyRepository, RecipientProfile } from "../application/recipient-journey.js";
-import type { PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
+import type { CheckoutDetails, PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
 import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.js";
 import type { GiverTrackerRepository, GiverTrackingRecord } from "../application/giver-tracker.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
@@ -9,7 +9,7 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
   private readonly boxes = new Map<string, RecipientBox>();
   private readonly sessions = new Map<string, { boxId: string }>();
   private readonly referrals = new Map<string, Referral>();
-  private readonly orders = new Map<string, PendingOrder>();
+  private readonly orders = new Map<string, { reference: string; parentBoxId: string; details: CheckoutDetails; paid: boolean; childCardToken?: string }>();
   private readonly trackers = new Map<string, GiverTrackingRecord>();
   private readonly recipientProfiles = new Map<string, RecipientProfile>();
   private readonly reminderPreferences = new Map<string, boolean>();
@@ -58,24 +58,52 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
     const referral = this.referrals.get(hashOpaqueToken(token));
     return referral && referral.expiresAt > new Date() ? referral : null;
   }
-  async createPendingOrder(referral: Referral, _customerEmail: string): Promise<PendingOrder> {
+  async createPendingOrder(referral: Referral, details: CheckoutDetails): Promise<PendingOrder> {
     const existing = this.orders.get(referral.id);
-    if (existing) return { ...existing, paymentReference: createReference("PAY"), trackerToken: null };
+    if (existing) {
+      if (existing.paid) throw new Error("This order is no longer awaiting payment");
+      existing.details = structuredClone(details);
+      return { reference: existing.reference, paymentReference: createReference("PAY"), status: "pending_payment", trackerToken: null };
+    }
     const trackerToken = createOpaqueToken();
     const reference = createReference("ORD");
-    const order = { reference, paymentReference: reference, status: "pending_payment" as const, trackerToken };
-    this.orders.set(referral.id, order);
-    this.trackers.set(hashOpaqueToken(trackerToken), { orderReference: order.reference, orderStatus: "pending_payment", paidAt: null, packedAt: null, collectedAt: null, deliveredAt: null });
-    return order;
+    this.orders.set(referral.id, { reference, parentBoxId: referral.parentBoxId, details: structuredClone(details), paid: false });
+    this.trackers.set(hashOpaqueToken(trackerToken), { orderReference: reference, orderStatus: "pending_payment", paidAt: null, packedAt: null, collectedAt: null, deliveredAt: null });
+    return { reference, paymentReference: reference, status: "pending_payment", trackerToken };
   }
   async findByTrackerToken(token: string): Promise<GiverTrackingRecord | null> { return this.trackers.get(hashOpaqueToken(token)) ?? null; }
+  orderDetailsFor(reference: string): CheckoutDetails | null { return [...this.orders.values()].find((order) => order.reference === reference)?.details ?? null; }
+
+  /**
+   * DEMO ONLY: stands in for a verified payment plus fulfilment, so the full chain can be walked in a browser without
+   * Paystack or staff. Creates the child box already delivered and returns its card token. Never wired in production.
+   */
+  async simulatePaidAndDelivered(reference: string): Promise<{ cardToken: string }> {
+    const order = [...this.orders.values()].find((candidate) => candidate.reference === reference);
+    if (!order) throw new Error("Order not found");
+    if (order.childCardToken) return { cardToken: order.childCardToken };
+    const parent = [...this.boxes.values()].find((box) => box.id === order.parentBoxId);
+    if (!parent) throw new Error("Parent box not found");
+    const parentRecipient = this.recipientProfiles.get(parent.id) ?? { firstName: null, lastInitial: null, area: null, displayConsent: false };
+    const cardToken = createOpaqueToken();
+    const now = new Date();
+    this.boxes.set(cardToken, {
+      id: randomUUID(), boxNumber: `GS-${String(this.boxes.size + 1).padStart(5, "0")}`, trailId: parent.trailId, parentBoxId: parent.id,
+      depth: parent.depth + 1, cardToken, fulfilmentStatus: "delivered", recipientStatus: "unknown",
+      giver: null, giverName: order.details.giverName, giverNote: order.details.note,
+      members: [...parent.members, { position: parent.depth + 2, participant: parentRecipient }]
+    });
+    order.paid = true; order.childCardToken = cardToken;
+    for (const [hash, tracker] of this.trackers) if (tracker.orderReference === reference) this.trackers.set(hash, { ...tracker, orderStatus: "paid", paidAt: now, packedAt: now, collectedAt: now, deliveredAt: now });
+    return { cardToken };
+  }
 }
 
 /** A recipient at depth 2: Teni started the trail (#1), Chioma (#2) passed to Dayo (#3), who passed to "you" (#4). */
 export const demoRecipientBoxes: RecipientBox[] = [{
   id: "box-demo-1", boxNumber: "GS-00001", trailId: "trail-demo", parentBoxId: "box-demo-parent", depth: 2,
   cardToken: "demo-card-token", fulfilmentStatus: "delivered", recipientStatus: "unknown",
-  giver: { firstName: "Dayo", lastInitial: "L", area: "Surulere", displayConsent: true },
+  giver: { firstName: "Dayo", lastInitial: "L", area: "Surulere", displayConsent: true }, giverName: null,
   giverNote: "You have carried so many of us this year. This one is for you.",
   members: [
     { position: 1, participant: { firstName: "Teni", lastInitial: "A", area: "Yaba", displayConsent: true } },

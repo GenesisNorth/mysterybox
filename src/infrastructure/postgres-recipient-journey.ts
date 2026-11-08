@@ -1,6 +1,6 @@
 import { Pool } from "pg";
 import type { RecipientBox, RecipientJourneyRepository, RecipientProfile, TrailMember } from "../application/recipient-journey.js";
-import type { PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
+import type { CheckoutDetails, PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
 import type { PaymentConfirmationStore, PaymentOrder } from "../application/payment-confirmation.js";
 import type { FulfilmentRepository } from "../application/fulfilment.js";
 import type { Box } from "../domain/box.js";
@@ -13,7 +13,7 @@ import type { MyStoriesRepository, StorySummary } from "../application/my-storie
 type BoxRow = {
   id: string; box_number: string; trail_id: string; parent_box_id: string | null; depth: number;
   fulfilment_status: RecipientBox["fulfilmentStatus"]; recipient_status: RecipientBox["recipientStatus"];
-  giver_first_name: string | null; giver_last_initial: string | null; giver_area: string | null; giver_display_consent: boolean | null; giver_note: string | null;
+  giver_first_name: string | null; giver_last_initial: string | null; giver_area: string | null; giver_display_consent: boolean | null; giver_note: string | null; giver_display_name: string | null;
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
@@ -29,7 +29,7 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     const result = await this.pool.query<BoxRow>(`
       SELECT b.id, b.box_number, b.trail_id, b.parent_box_id, b.depth, b.fulfilment_status, b.recipient_status,
         giver.first_name AS giver_first_name, giver.last_initial AS giver_last_initial, giver.area AS giver_area,
-        giver.display_consent AS giver_display_consent, b.giver_note
+        giver.display_consent AS giver_display_consent, b.giver_note, b.giver_display_name
       FROM boxes b LEFT JOIN participants giver ON giver.id = b.giver_participant_id
       LEFT JOIN box_cards card ON card.id = b.card_id
       WHERE card.token_hash = $1 OR b.qr_token_hash = $1`, [tokenHash]);
@@ -56,6 +56,7 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       giver: row.giver_first_name && row.giver_last_initial && row.giver_area && row.giver_display_consent !== null
         ? { firstName: row.giver_first_name, lastInitial: row.giver_last_initial, area: row.giver_area, displayConsent: row.giver_display_consent }
         : null,
+      giverName: row.giver_display_name,
       giverNote: row.giver_note,
       members: members.rows.map((member): TrailMember => ({ position: member.position, participant: {
         firstName: member.first_name, lastInitial: member.last_initial, area: member.area, displayConsent: member.display_consent ?? false
@@ -122,7 +123,9 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     return row ? { id: row.id, parentBoxId: row.parent_box_id, trailId: row.trail_id, expiresAt: row.expires_at } : null;
   }
 
-  async createPendingOrder(referral: Referral, customerEmail: string): Promise<PendingOrder> {
+  async createPendingOrder(referral: Referral, details: CheckoutDetails): Promise<PendingOrder> {
+    const customerEmail = details.customerEmail;
+    const detailValues = [details.giverName, details.note, details.deliveryTo, details.deliveryName, details.deliveryPhone, details.addressLine1, details.addressLine2, details.city, details.region, details.deliveryNotes];
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -133,6 +136,11 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       const current = existing.rows[0];
       if (current) {
         if (current.status !== "pending_payment") throw new Error("This order is no longer awaiting payment");
+        // The latest attempt's details win: the buyer may have corrected the note or address before paying.
+        await client.query(`
+          UPDATE orders SET giver_display_name = $2, gift_note = $3, delivery_to = $4, delivery_name = $5, delivery_phone = $6,
+            delivery_address_line_1 = $7, delivery_address_line_2 = $8, delivery_city = $9, delivery_region = $10, delivery_notes = $11
+          WHERE id = $1`, [current.id, ...detailValues]);
         const paymentReference = createReference("PAY");
         await client.query(`INSERT INTO payment_attempts (order_id, reference, customer_email) VALUES ($1, $2, $3)`, [current.id, paymentReference, customerEmail]);
         await client.query("COMMIT");
@@ -141,9 +149,11 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       const reference = createReference("ORD");
       const trackerToken = createOpaqueToken();
       const result = await client.query<{ id: string; reference: string; status: "pending_payment" }>(`
-      INSERT INTO orders (reference, referral_id, trail_id, parent_box_id, amount_kobo, currency, customer_email, status)
-      VALUES ($1, $2, $3, $4, $5, 'NGN', $6, 'pending_payment')
-      RETURNING id, reference, status`, [reference, referral.id, referral.trailId, referral.parentBoxId, this.passOnAmountKobo, customerEmail]);
+      INSERT INTO orders (reference, referral_id, trail_id, parent_box_id, amount_kobo, currency, customer_email, status,
+        giver_display_name, gift_note, delivery_to, delivery_name, delivery_phone,
+        delivery_address_line_1, delivery_address_line_2, delivery_city, delivery_region, delivery_notes)
+      VALUES ($1, $2, $3, $4, $5, 'NGN', $6, 'pending_payment', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      RETURNING id, reference, status`, [reference, referral.id, referral.trailId, referral.parentBoxId, this.passOnAmountKobo, customerEmail, ...detailValues]);
       const order = result.rows[0];
       if (!order) throw new Error("Order could not be created");
       await client.query(`INSERT INTO payment_attempts (order_id, reference, customer_email) VALUES ($1, $2, $3)`, [order.id, order.reference, customerEmail]);
@@ -177,11 +187,24 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       const parentResult = await client.query<{ trail_id: string; depth: number; fulfilment_status: string }>(`SELECT trail_id, depth, fulfilment_status FROM boxes WHERE id = $1 FOR KEY SHARE`, [order.parent_box_id]);
       const parent = parentResult.rows[0];
       if (!parent || parent.fulfilment_status === "cancelled" || parent.fulfilment_status === "refunded") throw new Error("Parent box cannot be continued");
+      const story = (await client.query<{
+        giver_display_name: string | null; gift_note: string | null; delivery_to: "giver" | "recipient" | null; delivery_name: string | null; delivery_phone: string | null;
+        delivery_address_line_1: string | null; delivery_address_line_2: string | null; delivery_city: string | null; delivery_region: string | null; delivery_notes: string | null;
+      }>(`SELECT giver_display_name, gift_note, delivery_to, delivery_name, delivery_phone, delivery_address_line_1, delivery_address_line_2,
+            delivery_city, delivery_region, delivery_notes FROM orders WHERE id = $1`, [order.id])).rows[0];
       const childResult = await client.query<{ id: string }>(`
-        INSERT INTO boxes (box_number, trail_id, parent_box_id, depth, fulfilment_status, paid_at)
-        VALUES ('GS-' || lpad(nextval('box_number_sequence')::text, 5, '0'), $1, $2, $3, 'paid', now()) RETURNING id`, [parent.trail_id, order.parent_box_id, parent.depth + 1]);
+        INSERT INTO boxes (box_number, trail_id, parent_box_id, depth, fulfilment_status, paid_at, giver_display_name, giver_note)
+        VALUES ('GS-' || lpad(nextval('box_number_sequence')::text, 5, '0'), $1, $2, $3, 'paid', now(), $4, $5) RETURNING id`,
+        [parent.trail_id, order.parent_box_id, parent.depth + 1, story?.giver_display_name ?? null, story?.gift_note ?? null]);
       const child = childResult.rows[0];
       if (!child) throw new Error("Child box could not be created");
+      // The shipping label moves to the staff-only delivery record of the box it belongs to.
+      if (story?.delivery_address_line_1 && story.delivery_city) {
+        await client.query(`
+          INSERT INTO delivery_details (box_id, address_line_1, address_line_2, city, region, delivery_notes, contact_name, contact_phone, delivery_to)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [child.id, story.delivery_address_line_1, story.delivery_address_line_2, story.delivery_city, story.delivery_region, story.delivery_notes, story.delivery_name, story.delivery_phone, story.delivery_to]);
+      }
       await client.query(`UPDATE orders SET status = 'paid', child_box_id = $2 WHERE id = $1`, [order.id, child.id]);
       await client.query(`INSERT INTO story_box_access (account_id, box_id)
         SELECT access.account_id, $2 FROM story_box_access access WHERE access.box_id = $1
@@ -322,19 +345,22 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
 
   async saveDeliveryDetails(boxId: string, details: DeliveryDetails): Promise<void> {
     await this.pool.query(`
-      INSERT INTO delivery_details (box_id, address_line_1, address_line_2, city, region, delivery_notes)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO delivery_details (box_id, address_line_1, address_line_2, city, region, delivery_notes, contact_name, contact_phone, delivery_to)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       ON CONFLICT (box_id) DO UPDATE SET address_line_1 = EXCLUDED.address_line_1, address_line_2 = EXCLUDED.address_line_2,
-        city = EXCLUDED.city, region = EXCLUDED.region, delivery_notes = EXCLUDED.delivery_notes, updated_at = now()`,
-      [boxId, details.addressLine1, details.addressLine2, details.city, details.region, details.deliveryNotes]);
+        city = EXCLUDED.city, region = EXCLUDED.region, delivery_notes = EXCLUDED.delivery_notes,
+        contact_name = COALESCE(EXCLUDED.contact_name, delivery_details.contact_name),
+        contact_phone = COALESCE(EXCLUDED.contact_phone, delivery_details.contact_phone),
+        delivery_to = COALESCE(EXCLUDED.delivery_to, delivery_details.delivery_to), updated_at = now()`,
+      [boxId, details.addressLine1, details.addressLine2, details.city, details.region, details.deliveryNotes, details.contactName ?? null, details.contactPhone ?? null, details.deliveryTo ?? null]);
   }
 
   async findDeliveryDetails(boxNumber: string): Promise<DeliveryDetails | null> {
-    const result = await this.pool.query<{ address_line_1: string; address_line_2: string | null; city: string; region: string | null; delivery_notes: string | null }>(`
-      SELECT d.address_line_1, d.address_line_2, d.city, d.region, d.delivery_notes
+    const result = await this.pool.query<{ address_line_1: string; address_line_2: string | null; city: string; region: string | null; delivery_notes: string | null; contact_name: string | null; contact_phone: string | null; delivery_to: "giver" | "recipient" | null }>(`
+      SELECT d.address_line_1, d.address_line_2, d.city, d.region, d.delivery_notes, d.contact_name, d.contact_phone, d.delivery_to
       FROM delivery_details d JOIN boxes b ON b.id = d.box_id WHERE b.box_number = $1`, [boxNumber]);
     const row = result.rows[0];
-    return row ? { addressLine1: row.address_line_1, addressLine2: row.address_line_2, city: row.city, region: row.region, deliveryNotes: row.delivery_notes } : null;
+    return row ? { addressLine1: row.address_line_1, addressLine2: row.address_line_2, city: row.city, region: row.region, deliveryNotes: row.delivery_notes, contactName: row.contact_name, contactPhone: row.contact_phone, deliveryTo: row.delivery_to } : null;
   }
 
   async saveParticipantIntake(boxId: string, intake: BoxParticipantIntake): Promise<void> {
