@@ -1,0 +1,102 @@
+# Gratitude Stories
+
+Gratitude Stories is a physical-gift experience where each box can continue one private, consent-safe trail of kindness.
+
+## First vertical slice
+
+This repository starts with the rules that must never be broken:
+
+- a box belongs to one immutable trail;
+- a child box is created only from its parent and inherits that trail;
+- a delivery state and a recipient state are separate;
+- public trail data is a privacy-safe projection, never a raw participant record;
+- payment confirmation is idempotent.
+
+The current local demo exposes a recipient box page at `http://localhost:3000/b/demo-card-token`. Confirming receipt creates a holder session and reveals only consent-safe trail data. It deliberately contains no real contact details, payment credentials, or delivery integration.
+
+Set `DATABASE_URL` to use PostgreSQL. Without it, the app uses one demo card in memory so the journey is easy to test locally.
+
+For a payment-enabled environment, configure `DATABASE_URL`, `PASS_ON_AMOUNT_KOBO` (an integer amount in kobo), `PAYSTACK_SECRET_KEY`, and the absolute HTTPS `PAYSTACK_CALLBACK_URL` (for example, `https://app.example.com/checkout/complete`). Checkout then creates an order server-side and redirects to Paystack with its fixed reference, email, amount, and callback URL. The webhook endpoint is `POST /webhooks/paystack`; it verifies Paystack's raw-payload signature and independently verifies the transaction before creating a child box. The callback only tells the customer that verification is underway—it never treats a browser redirect as payment proof.
+
+Staff operations require PostgreSQL and a `Bearer` token. Use a long, random `STAFF_ADMIN_TOKEN` or `STAFF_OPERATIONS_TOKEN` for bootstrap, then provision database-backed staff identities. The following PostgreSQL-backed endpoints return `Cache-Control: no-store`:
+
+For the next access-control increment, provision distinct `STAFF_ADMIN_TOKEN` and `STAFF_OPERATIONS_TOKEN` values. The shared token remains supported during migration, but should be retired once named staff credentials are deployed.
+
+An authenticated admin can provision a revocable database-backed identity with `POST /staff/users` (`email`, `role`). The returned opaque API token is shown once; store it in the staff member's secure credential manager.
+Revoke an active identity immediately with `POST /staff/users/:email/revoke`.
+`GET /staff/users` lists identity status and roles, never credential material.
+Rotate an active identity's token with `POST /staff/users/:email/rotate-token`; the new token is returned once.
+Change an active identity's role with `POST /staff/users/:email/role` (`role=admin|operations`).
+`GET /staff/users/:email/audit` is admin-only and returns that identity's lifecycle events.
+
+- `POST /staff/cards` with form field `quantity` (1–100) issues printable card codes and one-time raw QR tokens.
+- `GET /staff/cards?status=available|assigned|voided` lists inventory without QR tokens.
+- `POST /staff/cards/:cardCode/void` voids an available card for loss or damage. Assigned cards cannot be voided through this endpoint.
+- `POST /staff/boxes` creates a root trail and its first box in `created` state. It returns the internal box number and trail code, not participant information.
+- `GET /staff/boxes/:boxNumber` returns the privacy-minimized operational overview: lineage, statuses, card code/status, and fulfilment timestamps.
+- `GET /staff/boxes?query=...` searches box numbers and trail codes, returning only privacy-minimized operational summaries.
+- `GET /staff/boxes/:boxNumber/audit` returns the append-only operational history for that box, without private field values.
+- `GET`/`POST /staff/boxes/:boxNumber/delivery` reads or stores private delivery address and handoff notes. These fields are staff-only and never appear in public, recipient, or tracker responses.
+- `GET`/`POST /staff/boxes/:boxNumber/participants` reads or stores private giver/recipient contacts and the giver note. A recipient’s display consent is always ignored here and can only be set by that recipient after receipt confirmation.
+- `GET`/`POST /staff/boxes/:boxNumber/packing` reads or records the private packing checklist. A box cannot advance to `packed` without a completed checklist and named packer.
+- `GET`/`POST /staff/boxes/:boxNumber/collection` records and reads courier handoff before the box can become `collected`; `GET`/`POST /staff/boxes/:boxNumber/delivery-proof` records and reads private delivery proof before it can become `delivered`.
+- `POST /staff/boxes/:boxNumber/reminders` with `kind=receipt_confirmation|pass_forward` queues one future reminder only when the recipient has explicitly opted in and has an email. Provider delivery is intentionally not enabled yet.
+- `POST /staff/boxes/:boxNumber/reminders/:kind/cancel` cancels a queued reminder before it is sent.
+- `POST /staff/boxes/:boxNumber/reminders/:kind/retry` requeues a failed reminder; sent and cancelled jobs cannot be retried.
+- `POST /staff/reminders/recover` requeues reminder claims stuck in `processing` for more than 15 minutes.
+
+`staff-operations` can run fulfilment and see delivery records; only `staff-admin` can read or change private giver/recipient contact records.
+- `POST /staff/boxes/:boxNumber/card` with form field `cardCode` assigns an available card to a paid box. Staff never need the raw QR token.
+- `POST /staff/boxes/:boxNumber/card/replacement` with form field `cardCode` atomically replaces a paid box’s assigned card and voids the old card. This is the recovery path for a lost or damaged assigned card.
+- `POST /staff/boxes/:boxNumber/fulfilment` with form field `status` advances a box through `created → paid → packed → collected → delivered` (or valid cancellation/refund transitions). Invalid skips are rejected.
+
+Raw QR tokens are never stored and are returned only when a card batch is issued; send that response directly to the printing workflow over a protected connection.
+
+After confirming receipt, a recipient may optionally choose their public label for future recipients. Explicit consent is required before any label is displayed, and that label is limited to first name, last initial, and area. The recipient can decline; no public label is then stored.
+
+## My Stories
+
+After receipt confirmation, a recipient can choose **Save my story** and enter an email address. This creates an optional passwordless profile: the one-time link grants access to `/me`, where the recipient can see their saved box number and its fulfilment and recipient status. In local development, the link is displayed on screen for testing; production requires an email delivery provider before it can be sent to an inbox.
+
+When a saved box is continued and its pass-forward payment is verified, the profile automatically receives access to the newly created child box as part of the same database transaction. No public trail endpoint exposes this profile or its email address.
+
+## Run
+
+Copy `.env.example` to your deployment environment and set secrets there; do not commit a populated `.env` file.
+
+```sh
+npm install
+npm test
+npm run dev
+```
+
+For PostgreSQL environments, apply pending migrations before starting the service (safe to re-run; `db:status` lists applied and pending migrations):
+
+```sh
+DATABASE_URL=... npm run db:migrate
+DATABASE_URL=... npm run db:status
+```
+
+`db/schema.sql` is migration `001_initial_schema` and must not be edited. Put every schema change in a new numbered file such as `db/migrations/004_add_example.sql`; each file runs once, in name order, inside its own transaction.
+
+`GET /health` reports process liveness. `GET /ready` additionally checks PostgreSQL when `DATABASE_URL` is configured, and is the endpoint to use for deployment readiness checks.
+`GET /metrics` exposes in-memory aggregate request counts keyed only by method, redacted route category, and status. It requires `Authorization: Bearer $METRICS_TOKEN` and returns 404 unless that token is configured.
+Every response includes an `X-Request-ID` header; include it in staff/support reports rather than sharing card or session tokens.
+The service emits structured request logs with that ID, method, status, and redacted route category; it never logs card, tracker, or staff-identity path values.
+On `SIGTERM` or `SIGINT`, the service stops accepting connections and closes its PostgreSQL pool before exit.
+Production startup requires `DATABASE_URL`; holder and tracker cookies are marked `Secure` automatically in production.
+Set `TRUST_PROXY=true` only when a trusted reverse proxy sets `X-Forwarded-For`; this lets request throttling distinguish clients behind that proxy.
+
+GitHub Actions runs `npm ci`, type-checking, and the test suite on every push and pull request.
+
+## Architecture
+
+- `src/domain` — pure business rules and state transitions.
+- `src/application` — use cases which orchestrate domain rules and repositories.
+- `src/infrastructure` — HTTP server and, next, PostgreSQL/Paystack adapters.
+- `db/schema.sql` — PostgreSQL schema and database-level lineage protections.
+- `docs` — product and implementation decisions.
+
+See `docs/architecture.md` for the intended implementation sequence.
+See [the complete roadmap](docs/roadmap.md) for the pilot-to-production plan and current implementation status.
+# mysterybox
