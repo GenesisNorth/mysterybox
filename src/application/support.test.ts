@@ -97,3 +97,61 @@ test("the reminder message never names the giver, the recipient or anyone on the
   for (const name of ["Dayo", "Teni", "Chioma", "Ade"]) assert.ok(!message.includes(name));
   assert.match(message, /only reminder/);
 });
+
+test("due email reminders are sent automatically with a working link; text-message reminders stay manual", async () => {
+  const { reminders, sessionToken } = await holder(dayAgo);
+  await reminders.request("demo-card-token", sessionToken, { channel: "email", destination: "ade@example.com", consent: true });
+  const outbox: Array<{ to: string; subject: string; text: string }> = [];
+  const result = await reminders.dispatchDueEmails({ name: "test", send: async (message) => { outbox.push(message); } }, "https://gratitude.example");
+  assert.deepEqual(result, { sent: 1, failed: 0 });
+  assert.equal(outbox[0]?.to, "ade@example.com");
+  const link = outbox[0]!.text.match(/https:\/\/gratitude\.example\/r\/([A-Za-z0-9_-]+)/)![1]!;
+  assert.deepEqual(await reminders.linkPage(link), { kind: "ready", boxNumber: "GS-00001" });
+  assert.equal((await reminders.list())[0]?.status, "sent");
+  assert.deepEqual(await reminders.dispatchDueEmails({ name: "test", send: async () => assert.fail("nothing else is due") }, "https://gratitude.example"), { sent: 0, failed: 0 });
+
+  const sms = await holder(dayAgo);
+  await sms.reminders.request("demo-card-token", sms.sessionToken, { channel: "sms", destination: "08030000000", consent: true });
+  assert.deepEqual(await sms.reminders.dispatchDueEmails({ name: "test", send: async () => assert.fail("SMS is never emailed") }, "https://x"), { sent: 0, failed: 0 });
+});
+
+test("a failed automatic send stays scheduled for a later retry and is counted", async () => {
+  const { reminders, sessionToken } = await holder(dayAgo);
+  await reminders.request("demo-card-token", sessionToken, { channel: "email", destination: "ade@example.com", consent: true });
+  const failing = { name: "down", send: async () => { throw new Error("provider down"); } };
+  assert.deepEqual(await reminders.dispatchDueEmails(failing, "https://x"), { sent: 0, failed: 1 });
+  const [reminder] = await reminders.list();
+  assert.equal(reminder?.status, "scheduled"); assert.equal(reminder?.attempts, 1);
+  // Claimed within the last 10 minutes, so an immediate second run does not retry it.
+  assert.deepEqual(await reminders.dispatchDueEmails(failing, "https://x"), { sent: 0, failed: 0 });
+});
+
+test("reminders that are not due yet are never sent automatically", async () => {
+  const { reminders, sessionToken } = await holder();
+  await reminders.request("demo-card-token", sessionToken, { channel: "email", destination: "ade@example.com", consent: true });
+  assert.deepEqual(await reminders.dispatchDueEmails({ name: "test", send: async () => assert.fail("not due") }, "https://x"), { sent: 0, failed: 0 });
+});
+
+test("a recovery link moves a received box to a new phone once, and signs out every other phone", async () => {
+  const { repository, journey, sessionToken } = await holder();
+  const recovery = new (await import("./support.js")).HolderRecovery(repository);
+  const { link, expiresAt } = await recovery.issue("GS-00001", "admin@example.com", "https://gratitude.example/");
+  assert.match(link, /^https:\/\/gratitude\.example\/h\/[A-Za-z0-9_-]{43}$/);
+  assert.ok(expiresAt.getTime() - Date.now() > 47 * 3600_000);
+  const token = link.split("/h/")[1]!;
+  const newPhone = await recovery.use(token);
+  assert.ok(newPhone);
+  assert.equal((await journey.getPage("demo-card-token", newPhone!)).kind, "reveal");
+  assert.equal((await journey.getPage("demo-card-token", sessionToken)).kind, "read-only", "the old phone is signed out");
+  assert.equal(await recovery.use(token), null, "single use");
+});
+
+test("recovery links are refused for boxes not yet received, and expire", async () => {
+  const repository = new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
+  const { HolderRecovery } = await import("./support.js");
+  await assert.rejects(() => new HolderRecovery(repository).issue("GS-00001", "admin@example.com", "https://x"), /already been received/);
+  await new RecipientJourney(repository).confirm("demo-card-token");
+  const stale = new HolderRecovery(repository, () => new Date(Date.now() - 49 * 3600_000));
+  const { link } = await stale.issue("GS-00001", "admin@example.com", "https://x");
+  assert.equal(await stale.use(link.split("/h/")[1]!), null);
+});

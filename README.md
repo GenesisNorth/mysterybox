@@ -35,7 +35,7 @@ Change an active identity's role with `POST /staff/users/:email/role` (`role=adm
 - `POST /staff/boxes` creates a root trail and its first box in `created` state. It returns the internal box number and trail code, not participant information.
 - `GET /staff/boxes/:boxNumber` returns the privacy-minimized operational overview: lineage, statuses, card code/status, and fulfilment timestamps.
 - `GET /staff/boxes?query=...` searches box numbers and trail codes, returning only privacy-minimized operational summaries.
-- `GET /staff/boxes/:boxNumber/audit` returns the append-only operational history for that box, without private field values.
+- `GET /staff/boxes/:boxNumber/audit` returns the append-only operational history for that box, without private field values. Each event names its actor: the staff member's email (or `staff-admin` / `staff-operations` for bootstrap tokens), `public` for recipients and buyers, `paystack-webhook`, or `reminder-email-sender`.
 - `GET`/`POST /staff/boxes/:boxNumber/delivery` reads or stores private delivery address and handoff notes. These fields are staff-only and never appear in public, recipient, or tracker responses.
 - `GET`/`POST /staff/boxes/:boxNumber/participants` reads or stores private giver/recipient contacts and the giver note. A recipient’s display consent is always ignored here and can only be set by that recipient after receipt confirmation.
 - `GET`/`POST /staff/boxes/:boxNumber/packing` reads or records the private packing checklist. A box cannot advance to `packed` without a completed checklist and named packer.
@@ -70,11 +70,15 @@ Every box page links to `/b/:token/help` (“Not yet, or I need help?”). Anyon
 
 The decision card offers three answers: pass it forward, **Remind me in 24 hours**, or not this time (which is thanked, and can be changed later). A reminder needs the holder's session, a channel (email or text message), a destination and an explicit consent tick; the consent wording is stored with it. Each box can have one reminder, ever. Its link (`/r/:token`) works on any phone: both of its choices are buttons, so a mail scanner opening the link decides nothing. “Yes” signs that phone in as the holder and opens checkout; “No thanks” is final and marks the box decided. The message never names the giver, recipient or anyone on the trail. In local development the link is also shown on screen as a preview.
 
+When an email provider is configured (see below), due **email** reminders are sent automatically every minute; text-message reminders, and any email that failed three times, stay on the staff Reminders page.
+
+**“I changed phones.”** On a received box's page, an administrator who has confirmed the person's identity can issue a recovery link (`/h/:token`, single use, 48 hours). Opening it only shows a button; tapping it makes that phone the box's holder and signs out every other phone. The recipient then scans their card again.
+
 The earlier staff-queued reminder jobs (`/staff/boxes/:boxNumber/reminders`) and the recipient “reminder preferences” page remain in the API but are no longer linked from the box page.
 
 ## My Stories
 
-After receipt confirmation, a recipient can choose **Save my story** and enter an email address. This creates an optional passwordless profile: the one-time link grants access to `/me`, where the recipient can see their saved box number and its fulfilment and recipient status. In local development, the link is displayed on screen for testing; production requires an email delivery provider before it can be sent to an inbox.
+After receipt confirmation, a recipient can choose **Save my story** and enter an email address. This creates an optional passwordless profile: the one-time link grants access to `/me`, where the recipient can see their saved box number and its fulfilment and recipient status. The link is emailed through the configured provider and expires in 30 minutes; in local development it is also shown on screen. Without a provider, production says the feature is unavailable rather than promising an email.
 
 When a saved box is continued and its pass-forward payment is verified, the profile automatically receives access to the newly created child box as part of the same database transaction. No public trail endpoint exposes this profile or its email address.
 
@@ -114,7 +118,11 @@ On `SIGTERM` or `SIGINT`, the service stops accepting connections and closes its
 Production startup requires `DATABASE_URL`; holder and tracker cookies are marked `Secure` automatically in production.
 Set `TRUST_PROXY=true` only when a trusted reverse proxy sets `X-Forwarded-For`; this lets request throttling distinguish clients behind that proxy.
 
-GitHub Actions runs `npm ci`, type-checking, and the test suite on every push and pull request.
+GitHub Actions runs `npm ci`, migrations (twice, to prove they are repeatable), type-checking, and the full test suite on every push and pull request, including the PostgreSQL integration tests. Run those locally against a migrated database with `TEST_DATABASE_URL=postgres://… npm test`; they use random identifiers, so the same database can be reused.
+
+## Email
+
+Set `EMAIL_PROVIDER=resend` with `RESEND_API_KEY` and `EMAIL_FROM` (a sender on a domain verified in Resend) to send My Stories sign-in links and pass-forward reminder emails. `EMAIL_PROVIDER=log` prints emails, including their secret links, to the server log for local development and is refused in production. Leave it unset to keep reminders manual. The provider sits behind one small adapter (`src/infrastructure/email.ts`), so switching to another service means replacing one class. Emails never contain names or contact details of anyone on a trail.
 
 ## Architecture
 

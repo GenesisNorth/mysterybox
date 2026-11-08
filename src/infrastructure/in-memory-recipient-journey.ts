@@ -18,8 +18,9 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
   private readonly storySessions = new Map<string, string>();
   private readonly accounts = new Map<string, string>();
   private readonly storyAccess = new Map<string, Set<string>>();
+  private readonly recoveryLinks: Array<{ boxId: string; tokenHash: string; expiresAt: Date; usedAt: Date | null; createdBy: string }> = [];
   private readonly helpRequests: Array<{ boxId: string } & HelpRequestSummary> = [];
-  private readonly passForwardReminders: Array<{ id: string; boxId: string; channel: ReminderChannel; destination: string; consentText: string; sendAt: Date; tokenHash: string; status: PassForwardReminderStatus; sentAt: Date | null; respondedAt: Date | null; createdAt: Date }> = [];
+  private readonly passForwardReminders: Array<{ id: string; boxId: string; channel: ReminderChannel; destination: string; consentText: string; sendAt: Date; tokenHash: string; status: PassForwardReminderStatus; sentAt: Date | null; respondedAt: Date | null; createdAt: Date; claimedAt?: Date; attempts?: number }> = [];
   constructor(seed: RecipientBox[]) { for (const box of seed) this.boxes.set(box.cardToken, structuredClone(box)); }
 
   private boxById(boxId: string): [string, RecipientBox] | undefined { return [...this.boxes].find(([, box]) => box.id === boxId); }
@@ -53,11 +54,31 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
     return true;
   }
   async listPassForwardReminders(limit: number): Promise<StaffReminder[]> {
-    return this.passForwardReminders.slice(-limit).map((reminder) => ({ id: reminder.id, boxNumber: this.boxById(reminder.boxId)?.[1].boxNumber ?? "", channel: reminder.channel, destination: reminder.destination, sendAt: reminder.sendAt, status: reminder.status, sentAt: reminder.sentAt, respondedAt: reminder.respondedAt, passedOn: false }));
+    return this.passForwardReminders.slice(-limit).map((reminder) => ({ id: reminder.id, boxNumber: this.boxById(reminder.boxId)?.[1].boxNumber ?? "", channel: reminder.channel, destination: reminder.destination, sendAt: reminder.sendAt, status: reminder.status, sentAt: reminder.sentAt, respondedAt: reminder.respondedAt, passedOn: false, attempts: reminder.attempts ?? 0 }));
   }
   async issuePassForwardReminderLink(id: string, tokenHash: string): Promise<boolean> {
     const reminder = this.passForwardReminders.find((candidate) => candidate.id === id && candidate.status === "scheduled" && candidate.sendAt <= new Date());
     if (!reminder) return false; reminder.tokenHash = tokenHash; return true;
+  }
+  async claimDueEmailReminder(): Promise<{ id: string; destination: string } | null> {
+    const now = new Date();
+    const reminder = this.passForwardReminders.find((candidate) => candidate.status === "scheduled" && candidate.channel === "email" && candidate.sendAt <= now && (candidate.attempts ?? 0) < 3 && (!candidate.claimedAt || now.getTime() - candidate.claimedAt.getTime() > 10 * 60_000));
+    if (!reminder) return null;
+    reminder.claimedAt = now; reminder.attempts = (reminder.attempts ?? 0) + 1;
+    return { id: reminder.id, destination: reminder.destination };
+  }
+  async createHolderRecoveryLink(boxNumber: string, link: { tokenHash: string; expiresAt: Date; createdBy: string }): Promise<boolean> {
+    const box = [...this.boxes.values()].find((candidate) => candidate.boxNumber === boxNumber);
+    if (!box || box.fulfilmentStatus !== "delivered" || !["confirmed", "registered", "decided"].includes(box.recipientStatus)) return false;
+    this.recoveryLinks.push({ boxId: box.id, ...link, usedAt: null }); return true;
+  }
+  async consumeHolderRecoveryLink(tokenHash: string, newSessionTokenHash: string): Promise<boolean> {
+    const link = this.recoveryLinks.find((candidate) => candidate.tokenHash === tokenHash && !candidate.usedAt && candidate.expiresAt > new Date());
+    if (!link) return false;
+    link.usedAt = new Date();
+    for (const [token, session] of this.sessions) if (session.boxId === link.boxId) this.sessions.delete(token);
+    this.hashedSessions.set(newSessionTokenHash, { boxId: link.boxId });
+    return true;
   }
   async markPassForwardReminderSent(id: string): Promise<boolean> {
     const reminder = this.passForwardReminders.find((candidate) => candidate.id === id && candidate.status === "scheduled");
@@ -74,7 +95,8 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
     return false;
   }
   async createHolderSession(boxId: string): Promise<string> { const sessionToken = createOpaqueToken(); this.sessions.set(sessionToken, { boxId }); return sessionToken; }
-  async findHolderSession(sessionToken: string): Promise<{ boxId: string } | null> { return this.sessions.get(sessionToken) ?? null; }
+  private readonly hashedSessions = new Map<string, { boxId: string }>();
+  async findHolderSession(sessionToken: string): Promise<{ boxId: string } | null> { return this.sessions.get(sessionToken) ?? this.hashedSessions.get(hashOpaqueToken(sessionToken)) ?? null; }
   async updateRecipientProfile(boxId: string, profile: RecipientProfile): Promise<void> {
     for (const [token, box] of this.boxes) {
       if (box.id === boxId) {

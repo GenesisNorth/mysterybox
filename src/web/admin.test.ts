@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import type { StaffOperations } from "../application/staff-operations.js";
 import { handleAdmin, type StaffIdentity } from "./admin.js";
-import { HelpDesk, PassForwardReminders } from "../application/support.js";
+import { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "../infrastructure/in-memory-recipient-journey.js";
 
 const support = new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
@@ -22,7 +22,7 @@ const staff = {
 
 async function withServer(run: (base: string) => Promise<void>, production = false): Promise<void> {
   const server: Server = createServer(async (request, response) => {
-    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
+    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -101,7 +101,7 @@ test("reminder contact details are administrator-only; help requests are visible
 test("the reminders page splits due, upcoming and not-needed, and shows a prepared message once", async () => {
   const { remindersPageHtml } = await import("./admin-views.js");
   const now = new Date("2026-11-20T12:00:00Z");
-  const base = { channel: "email" as const, status: "scheduled" as const, sentAt: null, respondedAt: null, passedOn: false };
+  const base = { channel: "email" as const, status: "scheduled" as const, sentAt: null, respondedAt: null, passedOn: false, attempts: 0 };
   const page = remindersPageHtml({ actor: "admin@example.com", role: "admin" }, [
     { ...base, id: "11111111-1111-1111-1111-111111111111", boxNumber: "GS-00001", destination: "due@example.com<script>", sendAt: new Date("2026-11-20T10:00:00Z") },
     { ...base, id: "22222222-2222-2222-2222-222222222222", boxNumber: "GS-00002", destination: "later@example.com", sendAt: new Date("2026-11-21T10:00:00Z") },
@@ -112,3 +112,16 @@ test("the reminders page splits due, upcoming and not-needed, and shows a prepar
   assert.match(page, /reminders\/11111111-1111-1111-1111-111111111111\/sent/);
   assert.ok(!page.includes("<script>")); assert.ok(!page.includes("later@example.com"), "upcoming reminders do not show the destination yet");
 });
+
+test("only an administrator who confirms verification can issue a recovery link; opening it does not use it", () => withServer(async (base) => {
+  const ops = await post(base, "/admin/boxes/GS-00001/recovery-link", { verified: "yes" }, as("ops-token"));
+  assert.match(flashOf(ops).error ?? "", /Only an administrator/);
+  const unverified = await post(base, "/admin/boxes/GS-00001/recovery-link", {}, as("admin-token"));
+  assert.match(flashOf(unverified).error ?? "", /Confirm you have verified/);
+  const notReceived = await post(base, "/admin/boxes/GS-00001/recovery-link", { verified: "yes" }, as("admin-token"));
+  assert.match(flashOf(notReceived).error ?? "", /already been received/);
+  await new (await import("../application/recipient-journey.js")).RecipientJourney(support).confirm("demo-card-token");
+  const issued = await post(base, "/admin/boxes/GS-00001/recovery-link", { verified: "yes" }, as("admin-token"));
+  assert.equal(issued.status, 201);
+  assert.match(await issued.text(), /\/h\/[A-Za-z0-9_-]{43}/);
+}));

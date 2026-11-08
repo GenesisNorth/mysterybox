@@ -65,6 +65,13 @@ export function remindDoneHtml(token: string, sendAt: Date, previewLink: string 
   return layout(`<p class="eyebrow">A GENTLE REMINDER</p><h1>We’ll remind you once.</h1><section class="card"><p>Expect one message on ${escapeHtml(lagosDate(sendAt))}. That’s all we’ll send.</p>${preview}<p class="muted"><a href="/b/${encodeURIComponent(token)}">Back to your box</a></p></section>`);
 }
 
+export type RecoveryView = { kind: "ready" } | { kind: "done" } | { kind: "invalid" };
+export function recoveryHtml(view: RecoveryView, token: string): string {
+  if (view.kind === "invalid") return layout("<h1>This link is no longer valid.</h1><p class=\"muted\">It may have been used already or expired. Please ask the Gratitude Stories team for a new one.</p>");
+  if (view.kind === "done") return layout(`<p class="eyebrow">GRATITUDE STORIES</p><h1>You’re back in.</h1><section class="card"><p>This phone now holds your box. Scan the card from your box again to open its story.</p><p class="muted">Any other phone that had your box open has been signed out.</p></section>`);
+  return layout(`<p class="eyebrow">GRATITUDE STORIES</p><h1>Use this phone for your box?</h1><section class="card"><p>The Gratitude Stories team sent you this link because you changed phones. This phone will become the only one that can open your box.</p><form method="post" action="/h/${encodeURIComponent(token)}"><button>Yes, use this phone</button></form><p class="hint">This link works once.</p></section>`);
+}
+
 export type ReminderLinkView = { kind: "ready"; boxNumber: string } | { kind: "answered"; response: "accepted" | "declined" } | { kind: "invalid" } | { kind: "thanks" };
 export function reminderLinkHtml(view: ReminderLinkView, token: string): string {
   const r = encodeURIComponent(token);

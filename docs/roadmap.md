@@ -47,7 +47,7 @@ The schema now reserves `delivery_details` for private address and handoff instr
 
 ### Audit foundation
 
-`staff_audit_events` is append-only and populated by database triggers for box, card, private-intake, packing, collection, delivery, and staff-identity mutations. This avoids silent gaps from future API paths. Events currently identify the actor as `system`; per-request actor attribution is the remaining audit improvement.
+`staff_audit_events` is append-only and populated by database triggers for box, card, private-intake, packing, collection, delivery, and staff-identity mutations. This avoids silent gaps from future API paths. Every write now records its actor (staff email, `public`, `paystack-webhook` or a background worker name) through a transaction-local `app.actor` setting.
 
 ## Phase 2 — recipient experience and consent
 

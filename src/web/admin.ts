@@ -1,15 +1,19 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import QRCode from "qrcode";
 import type { StaffOperations } from "../application/staff-operations.js";
-import type { HelpDesk, PassForwardReminders } from "../application/support.js";
-import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, remindersPageHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
+import type { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
+import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
 import { cookieValue, formValues, isSameOrigin } from "./http.js";
+import { setActor } from "../infrastructure/actor-context.js";
 
 export type StaffIdentity = ConsoleIdentity;
 export interface AdminDependencies {
   staffOperations: StaffOperations | null;
   helpDesk: HelpDesk;
   reminders: PassForwardReminders;
+  recovery: HolderRecovery;
+  /** An email provider is connected, so email reminders are sent automatically. */
+  automaticEmail: boolean;
   identify(token: string | undefined): Promise<StaffIdentity | null>;
   production: boolean;
   /** The public origin printed into QR codes, e.g. https://gratitude.ng. Required in production. */
@@ -61,6 +65,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   const raw = cookieValue(request, cookieName);
   const identity = await deps.identify(raw ? decodeURIComponent(raw) : undefined);
   if (!identity) { redirect(response, "/admin/login", raw ? { error: "Your session has ended. Please sign in again." } : {}); return true; }
+  setActor(identity.actor);
   const admin = identity.role === "admin";
   const requireAdmin = () => { if (!admin) throw new Error("Only an administrator can do that"); };
 
@@ -80,7 +85,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     }
   }
 
-  const boxRoute = path.match(/^\/admin\/boxes\/([^/]+)(?:\/(advance|card|replace-card|pack|collect|deliver|delivery|participants))?$/);
+  const boxRoute = path.match(/^\/admin\/boxes\/([^/]+)(?:\/(advance|card|replace-card|pack|collect|deliver|delivery|participants|recovery-link))?$/);
   if (boxRoute?.[1]) {
     const boxNumber = decodeURIComponent(boxRoute[1]); const action = boxRoute[2];
     const back = `/admin/boxes/${encodeURIComponent(boxNumber)}`;
@@ -99,6 +104,17 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
         helpRequests: await deps.helpDesk.requestsForBox(boxNumber)
       };
       html(response, 200, boxDetailHtml(identity, detail, flash)); return true;
+    }
+    if (request.method === "POST" && action === "recovery-link") {
+      try {
+        requireAdmin();
+        if ((await formValues(request)).get("verified") !== "yes") throw new Error("Confirm you have verified the recipient first");
+        const base = deps.publicBaseUrl ?? (deps.production ? undefined : `http://${request.headers.host}`);
+        if (!base) throw new Error("Set PUBLIC_BASE_URL before issuing recovery links");
+        const { link, expiresAt } = await deps.recovery.issue(boxNumber, identity.actor, base);
+        html(response, 201, recoveryLinkHtml(identity, boxNumber, link, expiresAt));
+      } catch (error) { redirect(response, back, { error: message(error) }); }
+      return true;
     }
     if (request.method === "POST" && action) {
       try {
@@ -171,7 +187,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   // Reminder destinations are contact details, so this page is administrator-only.
   if (path === "/admin/reminders" || path.startsWith("/admin/reminders/")) {
     if (!admin) { html(response, 403, boxesHtml(identity, [], "", { error: "Only an administrator can see reminder contact details." })); return true; }
-    if (path === "/admin/reminders" && request.method === "GET") { html(response, 200, remindersPageHtml(identity, await deps.reminders.list(), new Date(), flash)); return true; }
+    if (path === "/admin/reminders" && request.method === "GET") { html(response, 200, remindersPageHtml(identity, await deps.reminders.list(), new Date(), flash, null, deps.automaticEmail)); return true; }
     const reminderRoute = path.match(/^\/admin\/reminders\/([0-9a-f-]{36})\/(prepare|sent)$/);
     if (reminderRoute?.[1] && request.method === "POST") {
       const [, id, step] = reminderRoute;
@@ -180,7 +196,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
         const base = deps.publicBaseUrl ?? (deps.production ? undefined : `http://${request.headers.host}`);
         if (!base) throw new Error("Set PUBLIC_BASE_URL before sending reminders");
         const prepared = await deps.reminders.prepare(id, base);
-        html(response, 200, remindersPageHtml(identity, await deps.reminders.list(), new Date(), { notice: "Message prepared. Copy it, send it, then mark it sent. Preparing again replaces the link." }, { id, ...prepared }));
+        html(response, 200, remindersPageHtml(identity, await deps.reminders.list(), new Date(), { notice: "Message prepared. Copy it, send it, then mark it sent. Preparing again replaces the link." }, { id, ...prepared }, deps.automaticEmail));
       } catch (error) { redirect(response, "/admin/reminders", { error: message(error) }); }
       return true;
     }

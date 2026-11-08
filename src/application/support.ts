@@ -1,6 +1,7 @@
 import { createOpaqueToken, hashOpaqueToken } from "../infrastructure/secrets.js";
 import type { RecipientJourneyRepository } from "./recipient-journey.js";
 import type { PassItForwardRepository } from "./pass-it-forward.js";
+import type { EmailSender } from "../infrastructure/email.js";
 
 export type HelpCategory = "not_arrived" | "damaged" | "lost_access" | "other";
 export const helpCategoryLabels: Record<HelpCategory, string> = {
@@ -23,7 +24,10 @@ export interface StaffReminder {
   sentAt: Date | null; respondedAt: Date | null;
   /** The box was passed forward after the reminder was requested, so the reminder is no longer needed. */
   passedOn: boolean;
+  /** Automatic email delivery attempts; at 3 the reminder is left for staff to send by hand. */
+  attempts: number;
 }
+export const maxAutomaticAttempts = 3;
 
 export interface SupportRepository {
   createHelpRequest(boxId: string, input: { category: HelpCategory; message: string | null; contact: string | null }): Promise<void>;
@@ -41,6 +45,18 @@ export interface SupportRepository {
   /** Replaces the link token of a due, scheduled reminder. Returns false otherwise. */
   issuePassForwardReminderLink(id: string, tokenHash: string): Promise<boolean>;
   markPassForwardReminderSent(id: string): Promise<boolean>;
+  /**
+   * Atomically claims one due, scheduled email reminder that has not been passed on, is not claimed by another sender in
+   * the last 10 minutes, and has fewer than 3 attempts; counts the attempt. Returns null when nothing is due.
+   */
+  claimDueEmailReminder(): Promise<{ id: string; destination: string } | null>;
+  /** Stores a recovery link for a delivered, already-received box. Returns false if the box is not eligible. */
+  createHolderRecoveryLink(boxNumber: string, link: { tokenHash: string; expiresAt: Date; createdBy: string }): Promise<boolean>;
+  /**
+   * Atomically uses an unexpired, unused link: ends every holder session for its box and stores the new one.
+   * Returns false when the link is unknown, used or expired.
+   */
+  consumeHolderRecoveryLink(tokenHash: string, newSessionTokenHash: string): Promise<boolean>;
 }
 type Store = SupportRepository & Pick<PassItForwardRepository, keyof RecipientJourneyRepository | "createReferral">;
 
@@ -72,6 +88,29 @@ export class HelpDesk {
   resolvedRequests(): Promise<HelpRequestSummary[]> { return this.repository.listHelpRequests("resolved", 100); }
   requestsForBox(boxNumber: string): Promise<HelpRequestSummary[]> { return this.repository.listHelpRequestsForBox(boxNumber); }
   async resolve(id: string, actor: string): Promise<void> { if (!await this.repository.resolveHelpRequest(id, actor)) throw new Error("That request is already resolved or does not exist"); }
+}
+
+export const recoveryLinkHours = 48;
+
+/** "I changed phones": staff-issued, single-use links that move a received box to a new phone. */
+export class HolderRecovery {
+  constructor(private readonly repository: SupportRepository, private readonly now = () => new Date()) {}
+
+  /** Administrator only (enforced by the caller): returns the raw link once; only its hash is stored. */
+  async issue(boxNumber: string, actor: string, baseUrl: string): Promise<{ link: string; expiresAt: Date }> {
+    const token = createOpaqueToken();
+    const expiresAt = new Date(this.now().getTime() + recoveryLinkHours * 60 * 60 * 1000);
+    if (!await this.repository.createHolderRecoveryLink(boxNumber, { tokenHash: hashOpaqueToken(token), expiresAt, createdBy: actor })) {
+      throw new Error("A recovery link can only be issued for a delivered box that has already been received");
+    }
+    return { link: `${baseUrl.replace(/\/$/, "")}/h/${token}`, expiresAt };
+  }
+
+  /** Returns the new holder session token, or null when the link cannot be used. */
+  async use(token: string): Promise<string | null> {
+    const session = createOpaqueToken();
+    return await this.repository.consumeHolderRecoveryLink(hashOpaqueToken(token), hashOpaqueToken(session)) ? session : null;
+  }
 }
 
 /** The privacy-safe reminder text. It never names the giver, the recipient or anyone on the trail. */
@@ -147,6 +186,24 @@ export class PassForwardReminders {
     if (!await this.repository.issuePassForwardReminderLink(id, hashOpaqueToken(token))) throw new Error("Only a scheduled reminder that is due can be prepared");
     const link = `${baseUrl.replace(/\/$/, "")}/r/${token}`;
     return { message: reminderMessage(link), link };
+  }
+
+  /**
+   * Sends due email reminders through the provider: each gets a fresh single-use link, then is marked sent.
+   * A failed send is retried by a later run (up to 3 attempts), then left for staff. Returns how many were sent.
+   */
+  async dispatchDueEmails(sender: EmailSender, baseUrl: string, limit = 20): Promise<{ sent: number; failed: number }> {
+    let sent = 0; let failed = 0;
+    for (let i = 0; i < limit; i++) {
+      const due = await this.repository.claimDueEmailReminder();
+      if (!due) break;
+      try {
+        const { message } = await this.prepare(due.id, baseUrl);
+        await sender.send({ to: due.destination, subject: "A gentle reminder from Gratitude Stories", text: message });
+        await this.markSent(due.id); sent++;
+      } catch { failed++; }
+    }
+    return { sent, failed };
   }
 
   async markSent(id: string): Promise<void> { if (!await this.repository.markPassForwardReminderSent(id)) throw new Error("Only a scheduled reminder can be marked sent"); }

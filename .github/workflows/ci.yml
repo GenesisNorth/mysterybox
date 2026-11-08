@@ -38,4 +38,7 @@ jobs:
         env:
           DATABASE_URL: postgres://gratitude:gratitude@localhost:5432/gratitude_stories
       - run: npm run typecheck
+      # TEST_DATABASE_URL turns on the PostgreSQL integration tests against the freshly migrated database.
       - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://gratitude:gratitude@localhost:5432/gratitude_stories

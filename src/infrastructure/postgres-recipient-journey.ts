@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import { ActorAwarePool } from "./actor-context.js";
 import type { RecipientBox, RecipientJourneyRepository, RecipientProfile, TrailMember } from "../application/recipient-journey.js";
 import type { CheckoutDetails, PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
 import type { PaymentConfirmationStore, PaymentOrder } from "../application/payment-confirmation.js";
@@ -19,7 +20,7 @@ type BoxRow = {
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
 export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository {
-  constructor(private readonly pool: Pool, private readonly passOnAmountKobo: number) {}
+  constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
   async close(): Promise<void> { await this.pool.end(); }
@@ -393,16 +394,47 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
   async listPassForwardReminders(limit: number): Promise<StaffReminder[]> {
-    const q = await this.pool.query<{ id: string; box_number: string; channel: ReminderChannel; destination: string; send_at: Date; status: PassForwardReminderStatus; sent_at: Date | null; responded_at: Date | null; passed_on: boolean }>(`
-      SELECT r.id, b.box_number, r.channel, r.destination, r.send_at, r.status, r.sent_at, r.responded_at,
+    const q = await this.pool.query<{ id: string; box_number: string; channel: ReminderChannel; destination: string; send_at: Date; status: PassForwardReminderStatus; sent_at: Date | null; responded_at: Date | null; passed_on: boolean; attempts: number }>(`
+      SELECT r.id, b.box_number, r.channel, r.destination, r.send_at, r.status, r.sent_at, r.responded_at, r.attempts,
         EXISTS (SELECT 1 FROM orders o WHERE o.parent_box_id = r.box_id AND o.status = 'paid' AND o.created_at >= r.created_at) AS passed_on
       FROM pass_forward_reminders r JOIN boxes b ON b.id = r.box_id
       ORDER BY CASE r.status WHEN 'scheduled' THEN 0 WHEN 'sent' THEN 1 ELSE 2 END, r.send_at ASC LIMIT $1`, [limit]);
-    return q.rows.map((r) => ({ id: r.id, boxNumber: r.box_number, channel: r.channel, destination: r.destination, sendAt: r.send_at, status: r.status, sentAt: r.sent_at, respondedAt: r.responded_at, passedOn: r.passed_on }));
+    return q.rows.map((r) => ({ id: r.id, boxNumber: r.box_number, channel: r.channel, destination: r.destination, sendAt: r.send_at, status: r.status, sentAt: r.sent_at, respondedAt: r.responded_at, passedOn: r.passed_on, attempts: r.attempts }));
   }
   async issuePassForwardReminderLink(id: string, tokenHash: string): Promise<boolean> {
     const q = await this.pool.query(`UPDATE pass_forward_reminders SET token_hash = $2 WHERE id = $1 AND status = 'scheduled' AND send_at <= now()`, [id, tokenHash]);
     return q.rowCount === 1;
+  }
+  async claimDueEmailReminder(): Promise<{ id: string; destination: string } | null> {
+    const row = (await this.pool.query<{ id: string; destination: string }>(`
+      UPDATE pass_forward_reminders r SET claimed_at = now(), attempts = r.attempts + 1
+      WHERE r.id = (
+        SELECT c.id FROM pass_forward_reminders c
+        WHERE c.status = 'scheduled' AND c.channel = 'email' AND c.send_at <= now() AND c.attempts < 3
+          AND (c.claimed_at IS NULL OR c.claimed_at < now() - interval '10 minutes')
+          AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.parent_box_id = c.box_id AND o.status = 'paid' AND o.created_at >= c.created_at)
+        ORDER BY c.send_at FOR UPDATE SKIP LOCKED LIMIT 1)
+      RETURNING r.id, r.destination`)).rows[0];
+    return row ?? null;
+  }
+  async createHolderRecoveryLink(boxNumber: string, link: { tokenHash: string; expiresAt: Date; createdBy: string }): Promise<boolean> {
+    const q = await this.pool.query(`
+      INSERT INTO holder_recovery_links (box_id, token_hash, expires_at, created_by)
+      SELECT id, $2, $3, $4 FROM boxes WHERE box_number = $1 AND fulfilment_status = 'delivered' AND recipient_status IN ('confirmed', 'registered', 'decided')`,
+      [boxNumber, link.tokenHash, link.expiresAt, link.createdBy]);
+    return q.rowCount === 1;
+  }
+  async consumeHolderRecoveryLink(tokenHash: string, newSessionTokenHash: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = (await client.query<{ box_id: string }>(`
+        UPDATE holder_recovery_links SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING box_id`, [tokenHash])).rows[0];
+      if (!row) { await client.query("ROLLBACK"); return false; }
+      await client.query(`UPDATE holder_sessions SET expires_at = now() WHERE box_id = $1 AND expires_at > now()`, [row.box_id]);
+      await client.query(`INSERT INTO holder_sessions (box_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days')`, [row.box_id, newSessionTokenHash]);
+      await client.query("COMMIT"); return true;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
   async markPassForwardReminderSent(id: string): Promise<boolean> {
     const q = await this.pool.query(`UPDATE pass_forward_reminders SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'scheduled'`, [id]);
@@ -491,5 +523,5 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
 
 export function postgresRecipientJourneyRepository(databaseUrl: string, passOnAmountKobo: number): PostgresRecipientJourneyRepository {
   if (!Number.isInteger(passOnAmountKobo) || passOnAmountKobo <= 0) throw new Error("PASS_ON_AMOUNT_KOBO must be a positive integer");
-  return new PostgresRecipientJourneyRepository(new Pool({ connectionString: databaseUrl }), passOnAmountKobo);
+  return new PostgresRecipientJourneyRepository(new ActorAwarePool(new Pool({ connectionString: databaseUrl })), passOnAmountKobo);
 }

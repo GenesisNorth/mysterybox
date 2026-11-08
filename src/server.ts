@@ -1,4 +1,6 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { runWithActor, setActor } from "./infrastructure/actor-context.js";
+import { emailSenderFromEnvironment } from "./infrastructure/email.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { RecipientJourney, type RecipientJourneyRepository } from "./application/recipient-journey.js";
@@ -8,8 +10,8 @@ import { PaymentConfirmation } from "./application/payment-confirmation.js";
 import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
 import { cookieValue, formValue, formValues, rawBody } from "./web/http.js";
 import { handleAdmin, type StaffIdentity } from "./web/admin.js";
-import { checkoutHtml, helpHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindDoneHtml, remindersHtml, remindHtml, reminderLinkHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
-import { HelpDesk, PassForwardReminders, SupportValidationError, type SupportRepository } from "./application/support.js";
+import { checkoutHtml, helpHtml, recoveryHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindDoneHtml, remindersHtml, remindHtml, reminderLinkHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
+import { HelpDesk, HolderRecovery, PassForwardReminders, SupportValidationError, type SupportRepository } from "./application/support.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "./infrastructure/in-memory-recipient-journey.js";
 import { postgresRecipientJourneyRepository } from "./infrastructure/postgres-recipient-journey.js";
 import { PaystackGateway } from "./infrastructure/paystack.js";
@@ -31,8 +33,16 @@ const giverTracker = new GiverTracker(repository);
 const myStories = new MyStories(repository);
 const helpDesk = new HelpDesk(repository);
 const passForwardReminders = new PassForwardReminders(repository);
+const holderRecovery = new HolderRecovery(repository);
 /** Optional WhatsApp support number in international format without "+", e.g. 2348030000000. */
 const supportWhatsapp = process.env.SUPPORT_WHATSAPP_NUMBER?.replace(/\D/g, "") || null;
+const production = process.env.NODE_ENV === "production";
+/** Null when EMAIL_PROVIDER is unset: reminders stay manual and My Stories links cannot be emailed. Misconfiguration fails at startup. */
+const emailSender = emailSenderFromEnvironment(process.env);
+/** Origin for links we send (QR cards, emails). Production must set PUBLIC_BASE_URL; development falls back to the request host. */
+function publicBaseUrlFor(request: IncomingMessage): string | null {
+  return process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ?? (production ? null : `http://${request.headers.host}`);
+}
 const paystack = process.env.PAYSTACK_SECRET_KEY ? new PaystackGateway(process.env.PAYSTACK_SECRET_KEY) : null;
 const paymentConfirmation = paystack && postgresRepository ? new PaymentConfirmation(paystack, postgresRepository) : null;
 const paystackCallbackUrl = process.env.PAYSTACK_CALLBACK_URL;
@@ -71,13 +81,16 @@ function logRoute(pathname: string): string {
   if (/^\/b\//.test(pathname)) return "/b/:token";
   if (/^\/t\//.test(pathname)) return "/t/:token";
   if (/^\/r\//.test(pathname)) return "/r/:token";
+  if (/^\/h\//.test(pathname)) return "/h/:token";
   if (/^\/staff\/users\//.test(pathname)) return "/staff/users/:identity";
   if (/^\/staff\/boxes\//.test(pathname)) return "/staff/boxes/:box";
   if (/^\/admin\/boxes\/[^/]+/.test(pathname)) return "/admin/boxes/:box";
   if (/^\/admin\/cards\/[^/]+/.test(pathname)) return "/admin/cards/:card";
   return pathname;
 }
-const server = createServer(async (request, response) => {
+// Every request starts as "public"; staff authentication and the payment webhook narrow the actor for the audit log.
+const server = createServer((request, response) => runWithActor("public", () => handleRequest(request, response)));
+async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const requestId = randomUUID();
   response.setHeader("x-request-id", requestId);
   response.setHeader("x-content-type-options", "nosniff");
@@ -103,11 +116,12 @@ const server = createServer(async (request, response) => {
     catch { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "not-ready" })); }
     return;
   }
-  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
+  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
   if (pathname.startsWith("/staff/")) {
     if (!staffOperations) { json(response, 503, { error: "Staff operations require PostgreSQL" }); return; }
     const identity = await staffIdentity(request);
     if (!identity) { response.writeHead(401, { "www-authenticate": "Bearer" }); response.end(); return; }
+    setActor(identity.actor);
     const adminOnly = request.method === "POST" && (pathname === "/staff/cards" || pathname === "/staff/boxes" || /\/staff\/cards\/GS-CARD-[A-Z0-9]+\/void$/.test(pathname) || /\/staff\/boxes\/[^/]+\/card\/replacement$/.test(pathname));
     if (adminOnly && identity.role !== "admin") { json(response, 403, { error: "Administrator access is required" }); return; }
     if (/^\/staff\/boxes\/[^/]+\/participants$/.test(pathname) && identity.role !== "admin") { json(response, 403, { error: "Administrator access is required for participant records" }); return; }
@@ -252,6 +266,7 @@ const server = createServer(async (request, response) => {
     response.writeHead(page.kind === "tracker" ? 200 : 404, { "content-type": "text/html; charset=utf-8" }); response.end(trackerHtml(page)); return;
   }
   if (pathname === "/webhooks/paystack" && request.method === "POST") {
+    setActor("paystack-webhook");
     if (!paystack || !paymentConfirmation) { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ error: "Payments are not configured" })); return; }
     try {
       const body = await rawBody(request);
@@ -364,6 +379,18 @@ const server = createServer(async (request, response) => {
       return;
     }
   }
+  // "I changed phones": the GET only shows a button, so a link scanner cannot use the single-use token.
+  const recoveryMatch = pathname.match(/^\/h\/([A-Za-z0-9_-]+)$/);
+  if (recoveryMatch?.[1]) {
+    const recoveryToken = recoveryMatch[1];
+    if (request.method === "GET") { htmlResponse(200, recoveryHtml({ kind: "ready" }, recoveryToken)); return; }
+    if (request.method === "POST") {
+      const session = await holderRecovery.use(recoveryToken);
+      if (!session) { htmlResponse(404, recoveryHtml({ kind: "invalid" }, recoveryToken)); return; }
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "set-cookie": `holder_session=${session}; HttpOnly${secureCookie}; SameSite=Lax; Path=/; Max-Age=2592000` });
+      response.end(recoveryHtml({ kind: "done" }, recoveryToken)); return;
+    }
+  }
   const profileMatch = pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/profile$/);
   if (profileMatch?.[1]) {
     const token = profileMatch[1];
@@ -392,7 +419,29 @@ const server = createServer(async (request, response) => {
     const token=saveStory[1]; const profile=await journey.profilePage(token,holderCookie(request));
     if (profile.kind!=="ready") { response.writeHead(403); response.end("Story profile is unavailable"); return; }
     if (request.method === "GET") { response.writeHead(200,{"content-type":"text/html; charset=utf-8"}); response.end(saveStoryHtml()); return; }
-    if (request.method === "POST") { try { const box=await repository.findByCardToken(token); if(!box) throw new Error(); const magic=await myStories.request(box.id,await formValue(request,"email")); const developmentLink=process.env.NODE_ENV === "production" ? "<p class=\"muted\">Check your email for a secure link.</p>" : `<p class="muted">Local preview link: <a href="/me/verify/${encodeURIComponent(magic)}">Open My Stories</a></p>`; response.writeHead(200,{"content-type":"text/html; charset=utf-8"}); response.end(saveStoryHtml(developmentLink)); } catch { response.writeHead(400); response.end("A valid email is required"); } return; }
+    if (request.method === "POST") {
+      const page = (status: number, message: string) => { response.writeHead(status, { "content-type": "text/html; charset=utf-8" }); response.end(saveStoryHtml(message)); };
+      const base = publicBaseUrlFor(request);
+      // Never claim "check your email" when nothing can be sent.
+      if (production && (!emailSender || !base)) { page(503, "<p class=\"error\">Saving stories by email isn’t available yet. Please try again later.</p>"); return; }
+      let email: string; let magic: string;
+      try {
+        email = (await formValue(request, "email")).trim().toLowerCase();
+        const box = await repository.findByCardToken(token); if (!box) throw new Error("Box not found");
+        magic = await myStories.request(box.id, email);
+      } catch { page(400, "<p class=\"error\">Enter a valid email address.</p>"); return; }
+      const link = `${base}/me/verify/${encodeURIComponent(magic)}`;
+      let message = "";
+      if (emailSender) {
+        try {
+          await emailSender.send({ to: email, subject: "Your Gratitude Stories sign-in link", text: `Open this link to see your saved stories: ${link}\n\nIt works once and expires in 30 minutes. If you didn't ask for it, you can ignore this email.` });
+          message = "<p class=\"muted\">Check your email for a secure sign-in link. It expires in 30 minutes.</p>";
+        } catch { message = "<p class=\"error\">We couldn’t send the email just now. Please try again in a few minutes.</p>"; }
+      }
+      if (!production) message += `<p class="hint">Local preview (development only): <a href="/me/verify/${encodeURIComponent(magic)}">Open My Stories</a></p>`;
+      page(200, message);
+      return;
+    }
   }
   const verifyStory=pathname.match(/^\/me\/verify\/([A-Za-z0-9_-]+)$/);
   if (verifyStory?.[1] && request.method === "GET") { const session=await myStories.verify(verifyStory[1]); if(!session){response.writeHead(404);response.end("This link is invalid or expired");return;} response.writeHead(303,{location:"/me","set-cookie":`stories_session=${session}; HttpOnly${secureCookie}; SameSite=Lax; Path=/me; Max-Age=7776000`});response.end();return; }
@@ -428,12 +477,28 @@ const server = createServer(async (request, response) => {
     response.writeHead(page.kind === "not-found" ? 404 : 200, { "content-type": "text/html; charset=utf-8" }); response.end(pageHtml(page, token, page.kind === "reveal" ? await passForwardReminders.status(token) : null)); return;
   }
   response.writeHead(405, { allow: "GET, POST", "content-type": "text/plain; charset=utf-8" }); response.end("Method not allowed");
-});
+}
 
 server.listen(port, () => console.log(`Gratitude Stories running at http://localhost:${port}`));
+
+// Automatic email reminders: every minute, send due "Remind me in 24 hours" emails (needs EMAIL_PROVIDER).
+const reminderBaseUrl = process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ?? (production ? null : `http://localhost:${port}`);
+let dispatchingReminders = false;
+async function dispatchReminderEmails(): Promise<void> {
+  if (!emailSender || !reminderBaseUrl || dispatchingReminders) return;
+  dispatchingReminders = true;
+  try {
+    const result = await runWithActor("reminder-email-sender", () => passForwardReminders.dispatchDueEmails(emailSender, reminderBaseUrl));
+    if (result.sent || result.failed) console.info(JSON.stringify({ event: "reminders.email", ...result }));
+  } catch { console.error(JSON.stringify({ event: "reminders.email.error" })); } finally { dispatchingReminders = false; }
+}
+if (emailSender && !reminderBaseUrl) console.warn(JSON.stringify({ event: "reminders.email.disabled", reason: "PUBLIC_BASE_URL is not set" }));
+const reminderTimer = emailSender && reminderBaseUrl ? setInterval(() => void dispatchReminderEmails(), 60_000) : null;
+reminderTimer?.unref();
 async function shutdown(signal: string): Promise<void> {
   console.info(JSON.stringify({ event: "shutdown", signal }));
   const forceExit = setTimeout(() => process.exit(1), 10_000);
+  if (reminderTimer) clearInterval(reminderTimer);
   server.close(async () => { clearTimeout(forceExit); if (postgresRepository) await postgresRepository.close(); process.exit(0); });
 }
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
