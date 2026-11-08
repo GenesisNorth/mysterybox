@@ -85,6 +85,8 @@ export interface StaffOperationsRepository extends FulfilmentRepository {
   findAuditEventsForBoxNumber(boxNumber: string, limit: number): Promise<AuditEvent[]>;
   findAuditEventsForStaffEmail(email: string, limit: number): Promise<AuditEvent[]>;
   searchStaffBoxes(query: string, limit: number): Promise<StaffBoxOverview[]>;
+  /** Most recently created first. */
+  listRecentStaffBoxes(limit: number): Promise<StaffBoxOverview[]>;
   createStaffUser(user: ProvisionedStaffUser): Promise<void>;
   revokeStaffUser(email: string): Promise<boolean>;
   listStaffUsers(): Promise<StaffUserSummary[]>;
@@ -179,6 +181,7 @@ export class StaffOperations {
   async deliveryRecord(boxNumber: string): Promise<DeliveryRecord> { const record = await this.repository.findDeliveryRecord(boxNumber); if (!record) throw new Error("Delivery record not found"); return record; }
   async auditHistory(boxNumber: string): Promise<AuditEvent[]> { return this.repository.findAuditEventsForBoxNumber(boxNumber, 100); }
   async staffAuditHistory(email: string): Promise<AuditEvent[]> { return this.repository.findAuditEventsForStaffEmail(email.trim().toLowerCase(), 100); }
+  async recentBoxes(): Promise<StaffBoxOverview[]> { return this.repository.listRecentStaffBoxes(50); }
   async searchBoxes(query: string): Promise<StaffBoxOverview[]> { const term = query.trim(); if (term.length < 2) throw new Error("Search needs at least two characters"); return this.repository.searchStaffBoxes(term, 50); }
   async provisionStaffUser(email: string, role: StaffRole): Promise<ProvisionedStaffUser> {
     const normalizedEmail = email.trim().toLowerCase();
@@ -269,6 +272,8 @@ export class StaffOperations {
     if (!box) throw new Error("Box not found");
     const advanced = moveFulfilment(box, nextStatus);
     if (nextStatus === "packed" && !await this.repository.findPackingRecord(boxNumber)) throw new Error("A completed packing record is required");
+    // The card is bound at packing; a box that leaves without one can never be opened by its recipient.
+    if (nextStatus === "packed" && !(await this.repository.findStaffBoxOverview(boxNumber))?.cardCode) throw new Error("Assign a printed card before packing");
     if (nextStatus === "collected" && !await this.repository.findCollectionRecord(boxNumber)) throw new Error("A collection record is required");
     if (nextStatus === "delivered" && !await this.repository.findDeliveryRecord(boxNumber)) throw new Error("A delivery record is required");
     await this.repository.saveFulfilmentStatus(advanced);

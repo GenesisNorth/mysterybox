@@ -9,6 +9,7 @@ import type { AuditEvent, BoxParticipantIntake, CardStatus, CollectionRecord, De
 import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.js";
 import type { DeliverableReminder, ReminderDeliveryStore } from "../application/reminders.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
+import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
 type BoxRow = {
   id: string; box_number: string; trail_id: string; parent_box_id: string | null; depth: number;
@@ -17,7 +18,7 @@ type BoxRow = {
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
-export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository {
+export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository {
   constructor(private readonly pool: Pool, private readonly passOnAmountKobo: number) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
@@ -108,7 +109,7 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
   async updateReminderPreference(boxId: string, emailOptIn: boolean): Promise<void> { await this.pool.query(`INSERT INTO reminder_preferences (box_id,email_opt_in) VALUES ($1,$2) ON CONFLICT (box_id) DO UPDATE SET email_opt_in=EXCLUDED.email_opt_in,updated_at=now()`,[boxId,emailOptIn]); }
   async findReminderPreference(boxId: string): Promise<boolean> { const q=await this.pool.query<{email_opt_in:boolean}>(`SELECT email_opt_in FROM reminder_preferences WHERE box_id=$1`,[boxId]); return q.rows[0]?.email_opt_in ?? false; }
 
-  async createReferral(parentBox: RecipientBox): Promise<string> {
+  async createReferral(parentBox: Pick<RecipientBox, "id" | "trailId">): Promise<string> {
     const token = createOpaqueToken();
     await this.pool.query(`INSERT INTO referrals (parent_box_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days')`, [parentBox.id, hashOpaqueToken(token)]);
     return token;
@@ -320,6 +321,7 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     const result = await this.pool.query<{ box_number:string; trail_code:string; parent_box_number:string|null; depth:number; fulfilment_status:Box["fulfilmentStatus"]; recipient_status:Box["recipientStatus"]; card_code:string|null; card_status:CardStatus|null; created_at:Date; packed_at:Date|null; collected_at:Date|null; delivered_at:Date|null }>(`SELECT b.box_number,t.code trail_code,parent.box_number parent_box_number,b.depth,b.fulfilment_status,b.recipient_status,card.card_code,card.status card_status,b.created_at,b.packed_at,b.collected_at,b.delivered_at FROM boxes b JOIN trails t ON t.id=b.trail_id LEFT JOIN boxes parent ON parent.id=b.parent_box_id LEFT JOIN box_cards card ON card.id=b.card_id WHERE b.box_number ILIKE '%' || $1 || '%' OR t.code ILIKE '%' || $1 || '%' ORDER BY b.created_at DESC LIMIT $2`,[query,limit]);
     return result.rows.map(r=>({boxNumber:r.box_number,trailCode:r.trail_code,parentBoxNumber:r.parent_box_number,depth:r.depth,fulfilmentStatus:r.fulfilment_status,recipientStatus:r.recipient_status,cardCode:r.card_code,cardStatus:r.card_status,createdAt:r.created_at,packedAt:r.packed_at,collectedAt:r.collected_at,deliveredAt:r.delivered_at}));
   }
+  async listRecentStaffBoxes(limit: number): Promise<StaffBoxOverview[]> { return this.searchStaffBoxes("", limit); }
   async createStaffUser(user: ProvisionedStaffUser): Promise<void> { await this.pool.query(`INSERT INTO staff_users (email,role,api_token_hash) VALUES ($1,$2,$3)`,[user.email,user.role,hashOpaqueToken(user.apiToken)]); }
   async revokeStaffUser(email: string): Promise<boolean> { const result=await this.pool.query(`UPDATE staff_users SET active=false,revoked_at=now() WHERE email=$1 AND active=true AND revoked_at IS NULL`,[email]); return result.rowCount===1; }
   async listStaffUsers(): Promise<StaffUserSummary[]> { const q=await this.pool.query<{email:string;role:StaffRole;active:boolean;created_at:Date;revoked_at:Date|null}>(`SELECT email,role,active,created_at,revoked_at FROM staff_users ORDER BY created_at DESC`); return q.rows.map(r=>({email:r.email,role:r.role,active:r.active,createdAt:r.created_at,revokedAt:r.revoked_at})); }
@@ -342,6 +344,70 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
   async listStories(accountId: string): Promise<StorySummary[]> { const q=await this.pool.query<{box_number:string;fulfilment_status:string;recipient_status:string}>(`SELECT b.box_number,b.fulfilment_status,b.recipient_status FROM story_box_access a JOIN boxes b ON b.id=a.box_id WHERE a.account_id=$1 ORDER BY a.created_at DESC`,[accountId]); return q.rows.map(r=>({boxNumber:r.box_number,fulfilmentStatus:r.fulfilment_status,recipientStatus:r.recipient_status})); }
   async cancelReminder(boxNumber: string, kind: ReminderKind): Promise<boolean> { const q=await this.pool.query(`UPDATE reminder_jobs j SET status='cancelled' FROM boxes b WHERE j.box_id=b.id AND b.box_number=$1 AND j.kind=$2 AND j.status='queued'`,[boxNumber,kind]); return q.rowCount===1; }
   async retryReminder(boxNumber: string, kind: ReminderKind): Promise<boolean> { const q=await this.pool.query(`UPDATE reminder_jobs j SET status='queued',scheduled_at=now() FROM boxes b WHERE j.box_id=b.id AND b.box_number=$1 AND j.kind=$2 AND j.status='failed'`,[boxNumber,kind]); return q.rowCount===1; }
+
+  // --- Help requests ("Not yet / I need help") ---
+  async createHelpRequest(boxId: string, input: { category: HelpCategory; message: string | null; contact: string | null }): Promise<void> {
+    await this.pool.query(`INSERT INTO help_requests (box_id, category, message, contact) VALUES ($1, $2, $3, $4)`, [boxId, input.category, input.message, input.contact]);
+  }
+  async countOpenHelpRequests(boxId: string): Promise<number> {
+    return (await this.pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM help_requests WHERE box_id = $1 AND status = 'open'`, [boxId])).rows[0]?.n ?? 0;
+  }
+  private async helpRequests(where: string, params: unknown[]): Promise<HelpRequestSummary[]> {
+    const q = await this.pool.query<{ id: string; box_number: string; category: HelpCategory; message: string | null; contact: string | null; status: "open" | "resolved"; created_at: Date; resolved_at: Date | null; resolved_by: string | null }>(`
+      SELECT h.id, b.box_number, h.category, h.message, h.contact, h.status, h.created_at, h.resolved_at, h.resolved_by
+      FROM help_requests h JOIN boxes b ON b.id = h.box_id ${where}`, params);
+    return q.rows.map((r) => ({ id: r.id, boxNumber: r.box_number, category: r.category, message: r.message, contact: r.contact, status: r.status, createdAt: r.created_at, resolvedAt: r.resolved_at, resolvedBy: r.resolved_by }));
+  }
+  async listHelpRequests(status: "open" | "resolved", limit: number): Promise<HelpRequestSummary[]> { return this.helpRequests(`WHERE h.status = $1 ORDER BY h.created_at ${status === "open" ? "ASC" : "DESC"} LIMIT $2`, [status, limit]); }
+  async listHelpRequestsForBox(boxNumber: string): Promise<HelpRequestSummary[]> { return this.helpRequests(`WHERE b.box_number = $1 ORDER BY h.created_at DESC LIMIT 50`, [boxNumber]); }
+  async resolveHelpRequest(id: string, actor: string): Promise<boolean> {
+    const q = await this.pool.query(`UPDATE help_requests SET status = 'resolved', resolved_at = now(), resolved_by = $2 WHERE id = $1 AND status = 'open'`, [id, actor]);
+    return q.rowCount === 1;
+  }
+
+  // --- "Remind me in 24 hours" ---
+  async createPassForwardReminder(boxId: string, r: { channel: ReminderChannel; destination: string; consentText: string; sendAt: Date; tokenHash: string }): Promise<boolean> {
+    const q = await this.pool.query(`
+      INSERT INTO pass_forward_reminders (box_id, channel, destination, consent_text, send_at, token_hash) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (box_id) DO NOTHING`, [boxId, r.channel, r.destination, r.consentText, r.sendAt, r.tokenHash]);
+    return q.rowCount === 1;
+  }
+  async findPassForwardReminderForBox(boxId: string): Promise<{ status: PassForwardReminderStatus; sendAt: Date } | null> {
+    const row = (await this.pool.query<{ status: PassForwardReminderStatus; send_at: Date }>(`SELECT status, send_at FROM pass_forward_reminders WHERE box_id = $1`, [boxId])).rows[0];
+    return row ? { status: row.status, sendAt: row.send_at } : null;
+  }
+  async findPassForwardReminderByToken(tokenHash: string): Promise<ReminderLink | null> {
+    const row = (await this.pool.query<{ id: string; box_id: string; box_number: string; trail_id: string; status: PassForwardReminderStatus }>(`
+      SELECT r.id, r.box_id, b.box_number, b.trail_id, r.status FROM pass_forward_reminders r JOIN boxes b ON b.id = r.box_id WHERE r.token_hash = $1`, [tokenHash])).rows[0];
+    return row ? { id: row.id, boxId: row.box_id, boxNumber: row.box_number, trailId: row.trail_id, status: row.status } : null;
+  }
+  async respondToPassForwardReminder(id: string, response: "accepted" | "declined"): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = (await client.query<{ box_id: string }>(`
+        UPDATE pass_forward_reminders SET status = $2, responded_at = now() WHERE id = $1 AND status IN ('scheduled', 'sent') RETURNING box_id`, [id, response])).rows[0];
+      if (!row) { await client.query("ROLLBACK"); return false; }
+      if (response === "declined") await client.query(`UPDATE boxes SET recipient_status = 'decided' WHERE id = $1 AND recipient_status IN ('confirmed', 'registered')`, [row.box_id]);
+      await client.query("COMMIT"); return true;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async listPassForwardReminders(limit: number): Promise<StaffReminder[]> {
+    const q = await this.pool.query<{ id: string; box_number: string; channel: ReminderChannel; destination: string; send_at: Date; status: PassForwardReminderStatus; sent_at: Date | null; responded_at: Date | null; passed_on: boolean }>(`
+      SELECT r.id, b.box_number, r.channel, r.destination, r.send_at, r.status, r.sent_at, r.responded_at,
+        EXISTS (SELECT 1 FROM orders o WHERE o.parent_box_id = r.box_id AND o.status = 'paid' AND o.created_at >= r.created_at) AS passed_on
+      FROM pass_forward_reminders r JOIN boxes b ON b.id = r.box_id
+      ORDER BY CASE r.status WHEN 'scheduled' THEN 0 WHEN 'sent' THEN 1 ELSE 2 END, r.send_at ASC LIMIT $1`, [limit]);
+    return q.rows.map((r) => ({ id: r.id, boxNumber: r.box_number, channel: r.channel, destination: r.destination, sendAt: r.send_at, status: r.status, sentAt: r.sent_at, respondedAt: r.responded_at, passedOn: r.passed_on }));
+  }
+  async issuePassForwardReminderLink(id: string, tokenHash: string): Promise<boolean> {
+    const q = await this.pool.query(`UPDATE pass_forward_reminders SET token_hash = $2 WHERE id = $1 AND status = 'scheduled' AND send_at <= now()`, [id, tokenHash]);
+    return q.rowCount === 1;
+  }
+  async markPassForwardReminderSent(id: string): Promise<boolean> {
+    const q = await this.pool.query(`UPDATE pass_forward_reminders SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'scheduled'`, [id]);
+    return q.rowCount === 1;
+  }
 
   async saveDeliveryDetails(boxId: string, details: DeliveryDetails): Promise<void> {
     await this.pool.query(`

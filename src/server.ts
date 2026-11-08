@@ -6,7 +6,10 @@ import { MyStories, type MyStoriesRepository } from "./application/my-stories.js
 import { CheckoutValidationError, PassItForward, type PassItForwardRepository } from "./application/pass-it-forward.js";
 import { PaymentConfirmation } from "./application/payment-confirmation.js";
 import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
-import { checkoutHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindersHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
+import { cookieValue, formValue, formValues, rawBody } from "./web/http.js";
+import { handleAdmin, type StaffIdentity } from "./web/admin.js";
+import { checkoutHtml, helpHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindDoneHtml, remindersHtml, remindHtml, reminderLinkHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
+import { HelpDesk, PassForwardReminders, SupportValidationError, type SupportRepository } from "./application/support.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "./infrastructure/in-memory-recipient-journey.js";
 import { postgresRecipientJourneyRepository } from "./infrastructure/postgres-recipient-journey.js";
 import { PaystackGateway } from "./infrastructure/paystack.js";
@@ -19,13 +22,17 @@ const postgresRepository = process.env.DATABASE_URL
   ? postgresRecipientJourneyRepository(process.env.DATABASE_URL, passOnAmountKobo)
   : null;
 const demoRepository = postgresRepository ? null : new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
-const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository = postgresRepository ?? demoRepository!;
+const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository & SupportRepository = postgresRepository ?? demoRepository!;
 /** The payment simulator exists only for the in-memory demo, never with a database or in production. */
 const demoPayments = demoRepository && process.env.NODE_ENV !== "production" ? demoRepository : null;
 const journey = new RecipientJourney(repository);
 const passItForward = new PassItForward(repository);
 const giverTracker = new GiverTracker(repository);
 const myStories = new MyStories(repository);
+const helpDesk = new HelpDesk(repository);
+const passForwardReminders = new PassForwardReminders(repository);
+/** Optional WhatsApp support number in international format without "+", e.g. 2348030000000. */
+const supportWhatsapp = process.env.SUPPORT_WHATSAPP_NUMBER?.replace(/\D/g, "") || null;
 const paystack = process.env.PAYSTACK_SECRET_KEY ? new PaystackGateway(process.env.PAYSTACK_SECRET_KEY) : null;
 const paymentConfirmation = paystack && postgresRepository ? new PaymentConfirmation(paystack, postgresRepository) : null;
 const paystackCallbackUrl = process.env.PAYSTACK_CALLBACK_URL;
@@ -44,33 +51,17 @@ function isRateLimited(request: IncomingMessage, limit: number): boolean {
 }
 const staffOperations = postgresRepository ? new StaffOperations(postgresRepository) : null;
 
-function cookieValue(request: IncomingMessage, name: string): string | undefined {
-  const prefix = `${name}=`;
-  const cookie = request.headers.cookie?.split(";").map((item) => item.trim()).find((item) => item.startsWith(prefix));
-  return cookie?.slice(prefix.length);
-}
 function holderCookie(request: IncomingMessage): string | undefined { return cookieValue(request, "holder_session"); }
-async function formValues(request: IncomingMessage, maxLength = 10_000): Promise<URLSearchParams> {
-  let body = "";
-  for await (const chunk of request) { body += chunk; if (body.length > maxLength) throw new Error("Request body is too large"); }
-  return new URLSearchParams(body);
-}
-async function formValue(request: IncomingMessage, name: string): Promise<string> {
-  return (await formValues(request)).get(name) ?? "";
-}
-async function rawBody(request: IncomingMessage): Promise<string> {
-  let body = "";
-  for await (const chunk of request) { body += chunk; if (body.length > 100_000) throw new Error("Request body is too large"); }
-  return body;
-}
-type StaffIdentity = { actor: string; role: "admin" | "operations" };
-async function staffIdentity(request: IncomingMessage): Promise<StaffIdentity | null> {
-  const provided = request.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+/** Resolves a staff token (bootstrap env tokens first, then database-backed identities) to an identity. */
+async function staffIdentityForToken(provided: string | undefined): Promise<StaffIdentity | null> {
   const credentials: Array<[string | undefined, StaffIdentity]> = [[process.env.STAFF_ADMIN_TOKEN, { actor: "staff-admin", role: "admin" }], [process.env.STAFF_OPERATIONS_TOKEN, { actor: "staff-operations", role: "operations" }], [process.env.STAFF_ACCESS_TOKEN, { actor: "staff-legacy", role: "admin" }]];
   if (!provided) return null;
   for (const [secret, identity] of credentials) if (secret && secret.length === provided.length && timingSafeEqual(Buffer.from(secret), Buffer.from(provided))) return identity;
   if (postgresRepository) return postgresRepository.findStaffIdentityByToken(provided);
   return null;
+}
+async function staffIdentity(request: IncomingMessage): Promise<StaffIdentity | null> {
+  return staffIdentityForToken(request.headers.authorization?.match(/^Bearer (.+)$/)?.[1]);
 }
 function json(response: import("node:http").ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -79,8 +70,11 @@ function json(response: import("node:http").ServerResponse, status: number, body
 function logRoute(pathname: string): string {
   if (/^\/b\//.test(pathname)) return "/b/:token";
   if (/^\/t\//.test(pathname)) return "/t/:token";
+  if (/^\/r\//.test(pathname)) return "/r/:token";
   if (/^\/staff\/users\//.test(pathname)) return "/staff/users/:identity";
   if (/^\/staff\/boxes\//.test(pathname)) return "/staff/boxes/:box";
+  if (/^\/admin\/boxes\/[^/]+/.test(pathname)) return "/admin/boxes/:box";
+  if (/^\/admin\/cards\/[^/]+/.test(pathname)) return "/admin/cards/:card";
   return pathname;
 }
 const server = createServer(async (request, response) => {
@@ -109,6 +103,7 @@ const server = createServer(async (request, response) => {
     catch { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "not-ready" })); }
     return;
   }
+  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
   if (pathname.startsWith("/staff/")) {
     if (!staffOperations) { json(response, 503, { error: "Staff operations require PostgreSQL" }); return; }
     const identity = await staffIdentity(request);
@@ -309,6 +304,66 @@ const server = createServer(async (request, response) => {
     } catch { response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }); response.end("Demo order not found"); }
     return;
   }
+  const htmlResponse = (status: number, body: string) => { response.writeHead(status, { "content-type": "text/html; charset=utf-8" }); response.end(body); };
+
+  // "Not yet / I need help": open to anyone holding the card; reveals only the printed box number.
+  const helpMatch = pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/help$/);
+  if (helpMatch?.[1]) {
+    const token = helpMatch[1]; const page = await helpDesk.page(token);
+    if (page.kind === "not-found") { htmlResponse(404, pageHtml({ kind: "not-found" }, token)); return; }
+    const reason = new URL(request.url ?? "/", "http://localhost").searchParams.get("reason") ?? "";
+    const view = { boxNumber: page.boxNumber, token, whatsappNumber: supportWhatsapp, reason, sent: false };
+    if (request.method === "GET") { htmlResponse(200, helpHtml(view)); return; }
+    if (request.method === "POST") {
+      let values: Record<string, string> = {};
+      try {
+        values = Object.fromEntries(await formValues(request, 20_000));
+        await helpDesk.submit(token, { category: values.category ?? "", message: values.message ?? "", contact: values.contact ?? "" });
+        htmlResponse(201, helpHtml({ ...view, sent: true, values }));
+      } catch (error) { htmlResponse(error instanceof SupportValidationError ? 422 : 400, helpHtml({ ...view, error: error instanceof SupportValidationError ? error.message : "Your request could not be sent. Please try again.", values })); }
+      return;
+    }
+  }
+
+  // "Remind me in 24 hours": holder only, one consented reminder per box.
+  const remindMatch = pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/remind$/);
+  if (remindMatch?.[1]) {
+    const token = remindMatch[1];
+    if (!await passForwardReminders.canRequest(token, holderCookie(request))) { response.writeHead(303, { location: `/b/${encodeURIComponent(token)}` }); response.end(); return; }
+    if (request.method === "GET") { htmlResponse(200, remindHtml({ token })); return; }
+    if (request.method === "POST") {
+      let values: Record<string, string> = {};
+      try {
+        values = Object.fromEntries(await formValues(request));
+        const { token: linkToken, sendAt } = await passForwardReminders.request(token, holderCookie(request), { channel: values.channel ?? "", destination: values.destination ?? "", consent: values.consent === "yes" });
+        const preview = process.env.NODE_ENV === "production" ? null : `/r/${encodeURIComponent(linkToken)}`;
+        htmlResponse(201, remindDoneHtml(token, sendAt, preview));
+      } catch (error) { htmlResponse(422, remindHtml({ token, error: error instanceof SupportValidationError ? error.message : "Your reminder could not be saved. Please try again.", values })); }
+      return;
+    }
+  }
+
+  // The reminder's link: works on any phone. Both choices are POST buttons, so a mail scanner opening the link decides nothing.
+  const reminderLink = pathname.match(/^\/r\/([A-Za-z0-9_-]+)(?:\/(yes|no))?$/);
+  if (reminderLink?.[1]) {
+    const [, linkToken, answer] = reminderLink;
+    if (request.method === "GET" && !answer) { const view = await passForwardReminders.linkPage(linkToken); htmlResponse(view.kind === "invalid" ? 404 : 200, reminderLinkHtml(view, linkToken)); return; }
+    if (request.method === "POST" && answer === "yes") {
+      try {
+        const { sessionToken, referralToken } = await passForwardReminders.accept(linkToken);
+        response.writeHead(303, { location: "/checkout", "set-cookie": [
+          `holder_session=${sessionToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/; Max-Age=2592000`,
+          `checkout_referral=${referralToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/checkout; Max-Age=2592000`
+        ] }); response.end();
+      } catch { htmlResponse(404, reminderLinkHtml({ kind: "invalid" }, linkToken)); }
+      return;
+    }
+    if (request.method === "POST" && answer === "no") {
+      try { await passForwardReminders.decline(linkToken); htmlResponse(200, reminderLinkHtml({ kind: "thanks" }, linkToken)); }
+      catch { htmlResponse(404, reminderLinkHtml({ kind: "invalid" }, linkToken)); }
+      return;
+    }
+  }
   const profileMatch = pathname.match(/^\/b\/([A-Za-z0-9_-]+)\/profile$/);
   if (profileMatch?.[1]) {
     const token = profileMatch[1];
@@ -359,7 +414,7 @@ const server = createServer(async (request, response) => {
   if (request.method === "POST" && action === "pass") {
     try {
       const { referralToken } = await passItForward.begin(token, holderCookie(request));
-      response.writeHead(303, { location: "/checkout", "set-cookie": `checkout_referral=${referralToken}; HttpOnly; SameSite=Lax; Path=/checkout; Max-Age=2592000` }); response.end();
+      response.writeHead(303, { location: "/checkout", "set-cookie": `checkout_referral=${referralToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/checkout; Max-Age=2592000` }); response.end();
     } catch { response.writeHead(403, { "content-type": "text/plain; charset=utf-8" }); response.end("Only the confirmed holder can pass this box forward"); }
     return;
   }
@@ -370,7 +425,7 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && !action) {
     const page = await journey.getPage(token, holderCookie(request));
-    response.writeHead(page.kind === "not-found" ? 404 : 200, { "content-type": "text/html; charset=utf-8" }); response.end(pageHtml(page, token)); return;
+    response.writeHead(page.kind === "not-found" ? 404 : 200, { "content-type": "text/html; charset=utf-8" }); response.end(pageHtml(page, token, page.kind === "reveal" ? await passForwardReminders.status(token) : null)); return;
   }
   response.writeHead(405, { allow: "GET, POST", "content-type": "text/plain; charset=utf-8" }); response.end("Method not allowed");
 });

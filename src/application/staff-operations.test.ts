@@ -43,6 +43,7 @@ class Cards implements StaffOperationsRepository {
   async findAuditEventsForBoxNumber() { return []; }
   async findAuditEventsForStaffEmail() { return []; }
   async searchStaffBoxes() { return this.overview ? [this.overview] : []; }
+  async listRecentStaffBoxes() { return this.overview ? [this.overview] : []; }
   async createStaffUser() {}
   async revokeStaffUser(email: string) { return email === "ops@example.com"; }
   async listStaffUsers(): Promise<StaffUserSummary[]> { return [{ email: "ops@example.com", role: "operations", active: true, createdAt: new Date(), revokedAt: null }]; }
@@ -205,4 +206,15 @@ test("staff intake retains private contacts while recipient display consent stay
   assert.equal(intake.giver.displayConsent, true);
   assert.equal(intake.recipient.displayConsent, false);
   await assert.rejects(() => service.recordParticipantIntake("GS-00001", { giver: intake.giver, recipient: { ...intake.recipient, phone: null }, giverNote: null }), /contact method/);
+});
+
+test("a box cannot be marked packed until a printed card is bound to it", async () => {
+  const repository = new Cards();
+  const service = new StaffOperations(repository);
+  repository.overview = { ...repository.overview!, cardCode: null, cardStatus: null };
+  await service.recordPacking("GS-00001", { packedBy: "Bisi", checklistComplete: true, notes: null });
+  await assert.rejects(() => service.advanceFulfilment("GS-00001", "packed"), /Assign a printed card/);
+  assert.equal(repository.saved, null);
+  repository.overview = { ...repository.overview, cardCode: "GS-CARD-ONE", cardStatus: "assigned" };
+  assert.equal((await service.advanceFulfilment("GS-00001", "packed")).fulfilmentStatus, "packed");
 });

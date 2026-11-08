@@ -24,7 +24,7 @@ export interface RecipientJourneyRepository {
 export type BoxPage =
   | { kind: "not-found" } | { kind: "inactive" } | { kind: "in-transit"; boxNumber: string }
   | { kind: "confirm-receipt"; boxNumber: string }
-  | { kind: "reveal"; boxNumber: string; giver: string; note: string | null; trail: string[]; position: number }
+  | { kind: "reveal"; boxNumber: string; giver: string; note: string | null; trail: string[]; position: number; decided: boolean }
   /** Shown to anyone other than the holder once a box has been received: public-safe labels only, no note or actions. */
   | { kind: "read-only"; boxNumber: string; trail: string[] };
 export type ProfilePage = { kind: "ready" } | { kind: "not-found" } | { kind: "not-authorized" };
@@ -39,7 +39,7 @@ export class RecipientJourney {
     if (box.recipientStatus === "unknown" || box.recipientStatus === "scanned") return { kind: "confirm-receipt", boxNumber: box.boxNumber };
     const trail = [...box.members].sort((a, b) => a.position - b.position).map((member) => publicLabel(member.participant));
     if (!await this.holdsBox(box.id, holderSession)) return { kind: "read-only", boxNumber: box.boxNumber, trail };
-    return { kind: "reveal", boxNumber: box.boxNumber, giver: box.giverName ?? (box.giver ? publicLabel(box.giver) : "Someone who cares"), note: box.giverNote, trail, position: box.depth + 2 };
+    return { kind: "reveal", boxNumber: box.boxNumber, giver: box.giverName ?? (box.giver ? publicLabel(box.giver) : "Someone who cares"), note: box.giverNote, trail, position: box.depth + 2, decided: box.recipientStatus === "decided" };
   }
 
   /** The first device to confirm a delivered box becomes its only holder; a holder confirming again changes nothing. */

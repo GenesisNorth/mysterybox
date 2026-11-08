@@ -31,7 +31,7 @@ export interface CheckoutDetails {
 export class CheckoutValidationError extends Error {}
 
 export interface PassItForwardRepository extends RecipientJourneyRepository {
-  createReferral(parentBox: RecipientBox): Promise<string>;
+  createReferral(parentBox: Pick<RecipientBox, "id" | "trailId">): Promise<string>;
   findReferral(token: string): Promise<Referral | null>;
   /**
    * Creates the order on first call; later calls add a new payment attempt to the same pending order and replace its

@@ -54,6 +54,24 @@ Raw QR tokens are never stored and are returned only when a card batch is issued
 
 After confirming receipt, a recipient may optionally choose their public label for future recipients. Explicit consent is required before any label is displayed, and that label is limited to first name, last initial, and area. The recipient can decline; no public label is then stored.
 
+## Staff console
+
+`/admin` is the browser interface for running fulfilment; it uses the same rules as the `/staff` API and needs PostgreSQL. Staff sign in by pasting their access token, which is kept in an `HttpOnly`, `SameSite=Strict` cookie scoped to `/admin` for 12 hours; every form submission must also come from the console's own origin.
+
+- **Boxes** lists recent boxes (or searches by box number or trail code) without any contact details. Administrators can start a new trail.
+- **A box page** shows a single "next step" for its stage: mark paid → bind a printed card → pack (named packer plus a three-item checklist) → courier handoff → delivery proof. A box cannot be marked packed without a bound card. It also holds the private delivery details, the participant details (administrators only), card replacement and cancel/refund (administrators only), and the box's history.
+- **Cards** shows stock and lets administrators issue a batch. The printable A4 QR sheet is shown **once**, because card secrets are never stored: print it or save it as PDF straight away. Set `PUBLIC_BASE_URL` to the domain printed on the cards; production refuses to issue cards without it.
+- **Help** is the queue of “Not yet / I need help” requests, oldest first, with a resolve button that records who resolved it. A box page also lists its own requests.
+- **Reminders** (administrators only, because it shows contact details) lists “Remind me in 24 hours” requests: due now, coming up, and those no longer needed because the box was passed forward. Until an email/SMS provider is connected, staff send each one by hand: **Prepare message** issues a fresh single-use link and shows the exact text, staff send it, then **Mark as sent**.
+
+## Help and reminders for recipients
+
+Every box page links to `/b/:token/help` (“Not yet, or I need help?”). Anyone holding the card can use it; it shows only the printed box number. The recipient picks a reason, may add a message and a reply-to contact, and the request joins the staff Help queue (at most three open requests per box). Set `SUPPORT_WHATSAPP_NUMBER` to show a WhatsApp button prefilled with the box number.
+
+The decision card offers three answers: pass it forward, **Remind me in 24 hours**, or not this time (which is thanked, and can be changed later). A reminder needs the holder's session, a channel (email or text message), a destination and an explicit consent tick; the consent wording is stored with it. Each box can have one reminder, ever. Its link (`/r/:token`) works on any phone: both of its choices are buttons, so a mail scanner opening the link decides nothing. “Yes” signs that phone in as the holder and opens checkout; “No thanks” is final and marks the box decided. The message never names the giver, recipient or anyone on the trail. In local development the link is also shown on screen as a preview.
+
+The earlier staff-queued reminder jobs (`/staff/boxes/:boxNumber/reminders`) and the recipient “reminder preferences” page remain in the API but are no longer linked from the box page.
+
 ## My Stories
 
 After receipt confirmation, a recipient can choose **Save my story** and enter an email address. This creates an optional passwordless profile: the one-time link grants access to `/me`, where the recipient can see their saved box number and its fulfilment and recipient status. In local development, the link is displayed on screen for testing; production requires an email delivery provider before it can be sent to an inbox.
@@ -68,6 +86,15 @@ Copy `.env.example` to your deployment environment and set secrets there; do not
 npm install
 npm test
 npm run dev
+```
+
+Without `DATABASE_URL`, `npm run dev` serves the in-memory recipient demo (no staff console). To run everything locally, start a PostgreSQL 16 container, put your settings in a git-ignored `.env.local` (see `.env.example`), migrate, and start with that file:
+
+```sh
+docker run -d --name gratitude-dev-db -e POSTGRES_USER=gratitude -e POSTGRES_PASSWORD=gratitude -e POSTGRES_DB=gratitude_stories \
+  -p 55433:5432 -v gratitude-dev-db:/var/lib/postgresql/data postgres:16
+DATABASE_URL=postgres://gratitude:gratitude@localhost:55433/gratitude_stories npm run db:migrate
+npx tsx watch --env-file=.env.local src/server.ts
 ```
 
 For PostgreSQL environments, apply pending migrations before starting the service (safe to re-run; `db:status` lists applied and pending migrations):
