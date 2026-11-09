@@ -84,7 +84,7 @@ When a saved box is continued and its pass-forward payment is verified, the prof
 
 ## Run
 
-Copy `.env.example` to your deployment environment and set secrets there; do not commit a populated `.env` file.
+Copy `.env.example` to your deployment environment and set secrets there; do not commit a populated `.env` file. **To put the app on the internet, follow [docs/deployment.md](docs/deployment.md)** (Render blueprint in `render.yaml`, or the `Dockerfile` for any container host). Production runs the compiled build: `npm run build`, `npm run db:migrate:built`, `npm start`.
 
 ```sh
 npm install

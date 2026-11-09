@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import QRCode from "qrcode";
 import type { StaffOperations } from "../application/staff-operations.js";
 import type { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
-import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
+import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, staffHtml, staffTokenHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
 import { cookieValue, formValues, isSameOrigin } from "./http.js";
 import { setActor } from "../infrastructure/actor-context.js";
 
@@ -198,6 +198,34 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
         const prepared = await deps.reminders.prepare(id, base);
         html(response, 200, remindersPageHtml(identity, await deps.reminders.list(), new Date(), { notice: "Message prepared. Copy it, send it, then mark it sent. Preparing again replaces the link." }, { id, ...prepared }, deps.automaticEmail));
       } catch (error) { redirect(response, "/admin/reminders", { error: message(error) }); }
+      return true;
+    }
+  }
+
+  // Staff accounts: administrators only. Nobody can revoke or demote their own account from here.
+  if (path === "/admin/staff" || path.startsWith("/admin/staff/")) {
+    if (!admin) { html(response, 403, boxesHtml(identity, [], "", { error: "Only an administrator can manage staff accounts." })); return true; }
+    if (path === "/admin/staff" && request.method === "GET") { html(response, 200, staffHtml(identity, await staff.staffUsers(), flash)); return true; }
+    if (path === "/admin/staff" && request.method === "POST") {
+      try {
+        const values = await formValues(request); const role = values.get("role");
+        if (role !== "admin" && role !== "operations") throw new Error("Choose a role");
+        const created = await staff.provisionStaffUser(values.get("email") ?? "", role);
+        html(response, 201, staffTokenHtml(identity, created.email, created.apiToken, false));
+      } catch (error) { redirect(response, "/admin/staff", { error: /duplicate|unique/i.test(message(error)) ? "That email already has an account." : message(error) }); }
+      return true;
+    }
+    const staffRoute = path.match(/^\/admin\/staff\/([^/]+)\/(rotate|role|revoke)$/);
+    if (staffRoute?.[1] && request.method === "POST") {
+      const email = decodeURIComponent(staffRoute[1]).trim().toLowerCase(); const step = staffRoute[2];
+      try {
+        if (email === identity.actor) throw new Error("You cannot change your own account here; ask another administrator.");
+        const values = await formValues(request);
+        if (step === "rotate") { const rotated = await staff.rotateStaffUserToken(email); html(response, 200, staffTokenHtml(identity, rotated.email, rotated.apiToken, true)); return true; }
+        if (step === "role") { const role = values.get("role"); if (role !== "admin" && role !== "operations") throw new Error("Choose a role"); await staff.changeStaffRole(email, role); redirect(response, "/admin/staff", { notice: `${email} is now ${role === "admin" ? "an administrator" : "operations staff"}.` }); return true; }
+        if (values.get("confirm") !== "yes") throw new Error("Tick the box to confirm revoking access");
+        await staff.revokeStaffUser(email); redirect(response, "/admin/staff", { notice: `Access revoked for ${email}.` });
+      } catch (error) { redirect(response, "/admin/staff", { error: message(error) }); }
       return true;
     }
   }

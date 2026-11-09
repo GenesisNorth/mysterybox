@@ -1,0 +1,51 @@
+# Render Blueprint: Dashboard → New → Blueprint → pick this repository.
+# Creates the web service and a managed PostgreSQL 16 database in Frankfurt (Render's closest region to Lagos).
+# Plan names and prices change; check them on the Blueprint preview screen before you confirm.
+# Values marked `sync: false` are asked for on that screen; set them there, never in this file.
+services:
+  - type: web
+    name: gratitude-stories
+    runtime: node
+    region: frankfurt
+    plan: starter
+    # devDependencies (TypeScript) are needed to build, then removed from the runtime.
+    buildCommand: npm ci --include=dev && npm run build && npm prune --omit=dev
+    # Applies new database migrations before each release goes live.
+    preDeployCommand: npm run db:migrate:built
+    startCommand: npm start
+    healthCheckPath: /ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      # Render's proxy sets X-Forwarded-For; this lets rate limiting see each visitor.
+      - key: TRUST_PROXY
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gratitude-stories-db
+          property: connectionString
+      # Random bootstrap token for the first administrator; view it once under the service's Environment tab.
+      - key: STAFF_ADMIN_TOKEN
+        generateValue: true
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: PASS_ON_AMOUNT_KOBO
+        sync: false
+      - key: SUPPORT_WHATSAPP_NUMBER
+        sync: false
+      - key: EMAIL_PROVIDER
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
+databases:
+  - name: gratitude-stories-db
+    region: frankfurt
+    plan: basic-256mb
+    postgresMajorVersion: "16"

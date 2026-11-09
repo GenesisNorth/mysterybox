@@ -1,4 +1,5 @@
 import type { FulfilmentStatus } from "../domain/box.js";
+import type { StaffUserSummary } from "../application/staff-operations.js";
 import type { AuditEvent, BoxParticipantIntake, CollectionRecord, DeliveryDetails, DeliveryRecord, PackingRecord, PrintedCard, StaffBoxOverview } from "../application/staff-operations.js";
 import { escapeHtml } from "./views.js";
 import { helpCategoryLabels, type HelpRequestSummary, type StaffReminder } from "../application/support.js";
@@ -16,7 +17,7 @@ const pill = (status: FulfilmentStatus) => `<span class="pill ${status}">${e(sta
 const boxHref = (boxNumber: string) => `/admin/boxes/${encodeURIComponent(boxNumber)}`;
 
 function consoleLayout(title: string, identity: ConsoleIdentity | null, flash: Flash, content: string): string {
-  const nav = identity ? `<nav><a href="/admin/boxes">Boxes</a><a href="/admin/help">Help</a>${identity.role === "admin" ? `<a href="/admin/reminders">Reminders</a>` : ""}<a href="/admin/cards">Cards</a><span class="who">${e(identity.actor)} · ${identity.role === "admin" ? "Administrator" : "Operations"}</span><form method="post" action="/admin/logout"><button class="link">Sign out</button></form></nav>` : "";
+  const nav = identity ? `<nav><a href="/admin/boxes">Boxes</a><a href="/admin/help">Help</a>${identity.role === "admin" ? `<a href="/admin/reminders">Reminders</a>` : ""}<a href="/admin/cards">Cards</a>${identity.role === "admin" ? `<a href="/admin/staff">Staff</a>` : ""}<span class="who">${e(identity.actor)} · ${identity.role === "admin" ? "Administrator" : "Operations"}</span><form method="post" action="/admin/logout"><button class="link">Sign out</button></form></nav>` : "";
   const messages = `${flash.notice ? `<p class="flash ok" role="status">${e(flash.notice)}</p>` : ""}${flash.error ? `<p class="flash bad" role="alert">${e(flash.error)}</p>` : ""}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>${e(title)} · Gratitude Stories staff</title><style>
 :root{--ink:#211a3d;--muted:#6d6681;--line:#e6e1ef;--plum:#5c3f92;--bg:#f6f4fa;--ok:#1d6b45;--bad:#8a1f2d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Avenir Next",Inter,"Helvetica Neue",Arial,sans-serif}
@@ -157,4 +158,26 @@ ${notNeeded.length ? `<div class="panel"><h2>No longer needed (${notNeeded.lengt
 /** Shown once: the link is not stored. */
 export function recoveryLinkHtml(identity: ConsoleIdentity, boxNumber: string, link: string, expiresAt: Date): string {
   return consoleLayout("Recovery link", identity, { notice: "Recovery link issued. Send it to the recipient now; it will not be shown again." }, `<p class="muted"><a href="${boxHref(boxNumber)}">← Back to ${e(boxNumber)}</a></p><h1>Recovery link for ${e(boxNumber)}</h1><div class="panel next"><label>Send this to the recipient (WhatsApp, SMS or email)</label><textarea readonly rows="3">Open this link on your new phone to get back to your Gratitude Stories box, then scan its card again: ${e(link)}</textarea><p class="muted">Works once, until ${e(when(expiresAt))}. Using it signs out any other phone.</p></div>`);
+}
+
+const staffHref = (email: string) => `/admin/staff/${encodeURIComponent(email)}`;
+export function staffHtml(identity: ConsoleIdentity, users: StaffUserSummary[], flash: Flash): string {
+  const rows = users.map((user) => {
+    const self = user.email === identity.actor;
+    const actions = !user.active ? `<span class="muted">Revoked ${e(when(user.revokedAt))}</span>` : self ? `<span class="muted">This is you</span>` : `
+<form method="post" action="${staffHref(user.email)}/role" class="inline" style="margin-bottom:8px"><select name="role" aria-label="Role for ${e(user.email)}"><option value="operations"${user.role === "operations" ? " selected" : ""}>Operations</option><option value="admin"${user.role === "admin" ? " selected" : ""}>Administrator</option></select><button class="secondary" style="margin:0">Change role</button></form>
+<form method="post" action="${staffHref(user.email)}/rotate" style="display:inline"><button class="secondary" style="margin:0">New token</button></form>
+<details style="display:inline-block;margin-left:10px"><summary>Revoke</summary><form method="post" action="${staffHref(user.email)}/revoke"><label class="check"><input type="checkbox" name="confirm" value="yes" required> Revoke access now</label><button class="danger">Revoke</button></form></details>`;
+    return `<tr><td>${e(user.email)}</td><td>${user.role === "admin" ? "Administrator" : "Operations"}</td><td>${user.active ? "Active" : "Revoked"}</td><td>${e(when(user.createdAt))}</td><td>${actions}</td></tr>`;
+  }).join("");
+  const bootstrap = identity.actor === "staff-admin" || identity.actor === "staff-legacy"
+    ? `<p class="flash ok">You are signed in with the bootstrap token. Create a named administrator account for yourself, sign in with it, then remove STAFF_ADMIN_TOKEN from the server settings.</p>` : "";
+  return consoleLayout("Staff", identity, flash, `<h1>Staff accounts</h1><p class="sub">Each person gets their own token, so the history shows who did what. Operations staff run fulfilment and help; administrators also see contact details, start trails, issue cards and manage staff.</p>${bootstrap}
+<div class="panel"><h2>Add a person</h2><form method="post" action="/admin/staff" class="inline"><div style="flex:1"><label for="email">Work email</label><input id="email" name="email" type="email" required maxlength="254" style="max-width:none"></div><div><label for="role">Role</label><select id="role" name="role"><option value="operations">Operations</option><option value="admin">Administrator</option></select></div><button>Create account</button></form></div>
+<div class="panel">${users.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Added</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="empty">No named staff accounts yet.</p>`}</div>`);
+}
+
+/** Shown once: tokens are stored only as hashes. */
+export function staffTokenHtml(identity: ConsoleIdentity, email: string, token: string, rotated: boolean): string {
+  return consoleLayout("Staff token", identity, { notice: rotated ? `New token issued for ${email}. Their old token stopped working.` : `Account created for ${email}.` }, `<p class="muted"><a href="/admin/staff">← Staff accounts</a></p><h1>Token for ${e(email)}</h1><div class="panel next"><label>Give this to them privately (e.g. in person or through a password manager). It will not be shown again.</label><input readonly value="${e(token)}" class="mono" aria-label="Access token"><p class="muted">They sign in at /admin/login by pasting it. If it is lost, issue a new one.</p></div>`);
 }

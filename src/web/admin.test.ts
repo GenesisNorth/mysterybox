@@ -125,3 +125,9 @@ test("only an administrator who confirms verification can issue a recovery link;
   assert.equal(issued.status, 201);
   assert.match(await issued.text(), /\/h\/[A-Za-z0-9_-]{43}/);
 }));
+
+test("only administrators can open or change staff accounts", () => withServer(async (base) => {
+  assert.equal((await fetch(`${base}/admin/staff`, { headers: as("ops-token") })).status, 403);
+  assert.equal((await post(base, "/admin/staff", { email: "x@example.com", role: "admin" }, as("ops-token"))).status, 403);
+  assert.equal((await post(base, "/admin/staff/ops%40example.com/revoke", { confirm: "yes" }, as("ops-token"))).status, 403);
+}));
