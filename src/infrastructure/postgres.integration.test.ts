@@ -249,3 +249,24 @@ test("expired secrets are purged after the grace period; referrals that became o
   assert.equal((await q(`SELECT count(*)::int n FROM referrals WHERE id = $1`, [unused])).rows[0].n, 0);
   assert.equal((await q(`SELECT count(*)::int n FROM referrals WHERE id = $1`, [ordered])).rows[0].n, 1);
 });
+
+test("dashboard analytics count boxes, the recipient journey and generations without personal data", { skip }, async () => {
+  const { repo } = db();
+  const before = await repo.dashboardAnalytics();
+  const t = await trail();
+  const root = await box(t, { recipient: await person("Private"), recipientStatus: "decided" });
+  await box(t, { parent: root, depth: 1, fulfilment: "paid" });
+  await box(t, { fulfilment: "delivered", recipientStatus: "scanned" });
+  const after = await repo.dashboardAnalytics();
+  assert.equal(after.totals.boxes - before.totals.boxes, 3);
+  assert.equal(after.totals.trails - before.totals.trails, 1);
+  assert.equal(after.pipeline.paid - before.pipeline.paid, 1);
+  assert.equal(after.journey.delivered - before.journey.delivered, 2);
+  assert.equal(after.journey.opened - before.journey.opened, 2);
+  assert.equal(after.journey.received - before.journey.received, 1);
+  assert.equal(after.journey.passedOn - before.journey.passedOn, 1);
+  assert.equal(after.weekly.length, 12);
+  assert.ok(after.weekly.at(-1)!.created - before.weekly.at(-1)!.created >= 3);
+  assert.ok(after.generations.some((row) => row.generation === 2));
+  assert.ok(!JSON.stringify(after).includes("Private"), "no names in analytics");
+});

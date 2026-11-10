@@ -4,7 +4,9 @@ For the person who packs, ships and supports boxes during the pilot. Everything 
 
 ## Every morning (15 minutes)
 
-1. **Help** tab: answer every open request, oldest first (see "Help requests" below). Mark each one resolved when done.
+Start on the **Overview** page (where you land after signing in). The four cards at the top tell you what needs doing today; each opens the right page.
+
+1. **Help requests**: answer every open request, oldest first (see "Help requests" below). Mark each one resolved when done.
 2. **Reminders** tab (administrators): send any text-message reminders that are due, and any email marked "Automatic sending failed". For each: **Prepare message**, send that exact text from the team phone or email, then **Mark as sent**.
 3. **Boxes** tab: check the counts. "To pack" boxes should leave within one working day.
 

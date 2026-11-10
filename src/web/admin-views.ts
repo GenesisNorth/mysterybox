@@ -2,13 +2,13 @@ import type { FulfilmentStatus } from "../domain/box.js";
 import type { StaffUserSummary } from "../application/staff-operations.js";
 import type { AuditEvent, BoxParticipantIntake, CollectionRecord, DeliveryDetails, DeliveryRecord, PackingRecord, PrintedCard, StaffBoxOverview } from "../application/staff-operations.js";
 import { escapeHtml } from "./views.js";
+import { consoleLayout, type ConsoleIdentity, type Flash } from "./admin-layout.js";
 import { helpCategoryLabels, type HelpRequestSummary, type StaffReminder } from "../application/support.js";
 
 // Staff console pages. Every value from users or the database must pass through escapeHtml (alias `e`).
 const e = (value: string | number | null | undefined) => escapeHtml(String(value ?? ""));
 
-export interface ConsoleIdentity { actor: string; role: "admin" | "operations"; }
-export interface Flash { notice?: string | null; error?: string | null; }
+export type { ConsoleIdentity, Flash } from "./admin-layout.js";
 
 const statusLabels: Record<FulfilmentStatus, string> = { created: "Awaiting payment", paid: "Paid · to pack", packed: "Packed · awaiting courier", collected: "With courier", delivered: "Delivered", cancelled: "Cancelled", refunded: "Refunded" };
 const recipientLabels: Record<StaffBoxOverview["recipientStatus"], string> = { unknown: "Not opened", scanned: "Scanned", confirmed: "Received", registered: "Received · named", decided: "Received · decided" };
@@ -16,38 +16,16 @@ const when = (date: Date | null | undefined) => date ? new Date(date).toLocaleSt
 const pill = (status: FulfilmentStatus) => `<span class="pill ${status}">${e(statusLabels[status])}</span>`;
 const boxHref = (boxNumber: string) => `/admin/boxes/${encodeURIComponent(boxNumber)}`;
 
-function consoleLayout(title: string, identity: ConsoleIdentity | null, flash: Flash, content: string): string {
-  const nav = identity ? `<nav><a href="/admin/boxes">Boxes</a><a href="/admin/help">Help</a>${identity.role === "admin" ? `<a href="/admin/reminders">Reminders</a>` : ""}<a href="/admin/cards">Cards</a>${identity.role === "admin" ? `<a href="/admin/staff">Staff</a>` : ""}<span class="who">${e(identity.actor)} · ${identity.role === "admin" ? "Administrator" : "Operations"}</span><form method="post" action="/admin/logout"><button class="link">Sign out</button></form></nav>` : "";
-  const messages = `${flash.notice ? `<p class="flash ok" role="status">${e(flash.notice)}</p>` : ""}${flash.error ? `<p class="flash bad" role="alert">${e(flash.error)}</p>` : ""}`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>${e(title)} · Gratitude Stories staff</title><style>
-:root{--ink:#211a3d;--muted:#6d6681;--line:#e6e1ef;--plum:#5c3f92;--bg:#f6f4fa;--ok:#1d6b45;--bad:#8a1f2d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Avenir Next",Inter,"Helvetica Neue",Arial,sans-serif}
-header{background:#1e1639;color:#fff}header .bar{display:flex;align-items:center;gap:24px;max-width:1100px;margin:auto;padding:14px 24px}header .brand{font-weight:800;letter-spacing:.12em;text-transform:uppercase;font-size:12px}header nav{display:flex;align-items:center;gap:18px;flex:1}header nav a{color:#ddd3f5;text-decoration:none;font-weight:600}header nav a:hover{color:#fff}header .who{margin-left:auto;color:#a99cc8;font-size:13px}
-main{max-width:1100px;margin:auto;padding:28px 24px 60px}h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}h2{margin:0 0 12px;font-size:17px}.sub{margin:0 0 22px;color:var(--muted)}
-.panel{margin-bottom:18px;padding:20px 22px;border:1px solid var(--line);border-radius:14px;background:#fff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.grid>.panel{margin:0}
-table{width:100%;border-collapse:collapse}th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}tr:last-child td{border-bottom:0}td a{color:var(--plum);font-weight:700}
-dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0}dt{color:var(--muted)}dd{margin:0;font-weight:600}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;background:#eee9f5;color:#4a3d61;font-size:12px;font-weight:700;white-space:nowrap}.pill.paid{background:#fff3d6;color:#7a5200}.pill.packed,.pill.collected{background:#e3edff;color:#1f4a99}.pill.delivered{background:#e1f4ea;color:var(--ok)}.pill.cancelled,.pill.refunded{background:#fbe5e7;color:var(--bad)}
-label{display:block;margin:12px 0 4px;color:#514766;font-size:13px;font-weight:700}input,select,textarea{width:100%;padding:9px 11px;border:1px solid #d8d1e6;border-radius:9px;background:#fff;color:var(--ink);font:inherit}textarea{min-height:70px}input:focus,select:focus,textarea:focus{outline:2px solid #c9b8f2;border-color:var(--plum)}
-.check{display:flex;gap:9px;align-items:flex-start;font-weight:600}.check input{width:auto;margin-top:4px}.row{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
-button{margin-top:14px;padding:10px 16px;border:0;border-radius:10px;background:var(--plum);color:#fff;font:700 14px/1.2 "Avenir Next",Inter,"Helvetica Neue",Arial,sans-serif;cursor:pointer}button.secondary{background:#eee9f5;color:#4a3d61}button.danger{background:var(--bad)}button.link{margin:0;padding:0;background:none;color:#ddd3f5;font-weight:600}
-.inline{display:flex;gap:10px;align-items:flex-end}.inline>*{margin-top:0}.inline input{max-width:320px}
-.flash{margin:0 0 18px;padding:12px 16px;border-radius:10px;font-weight:600}.flash.ok{background:#e1f4ea;color:var(--ok)}.flash.bad{background:#fbe5e7;color:var(--bad)}
-.muted{color:var(--muted)}.mono{font-family:ui-monospace,Menlo,monospace;font-size:13px}.next{border-color:#c9b8f2;box-shadow:0 0 0 3px #efe8fd}.empty{padding:26px;color:var(--muted);text-align:center}
-.stats{display:flex;gap:12px;margin-bottom:18px}.stat{flex:1;padding:14px 18px;border:1px solid var(--line);border-radius:12px;background:#fff}.stat b{display:block;font-size:24px}
-:focus-visible{outline:3px solid #c9b8f2;outline-offset:2px}details summary{cursor:pointer;color:var(--plum);font-weight:700}
-@media(max-width:800px){.grid,.row{grid-template-columns:1fr}header .bar{flex-wrap:wrap}}
-</style></head><body><header><div class="bar"><span class="brand">✦ Gratitude Stories · Staff</span>${nav}</div></header><main>${messages}${content}</main></body></html>`;
-}
 
 export function loginHtml(flash: Flash): string {
-  return consoleLayout("Sign in", null, flash, `<div class="panel" style="max-width:460px;margin:40px auto"><h1>Staff sign in</h1><p class="sub">Paste the staff access token you were given. It is stored only as a secure cookie on this browser for 12 hours.</p><form method="post" action="/admin/login"><label for="token">Access token</label><input id="token" name="token" type="password" required autocomplete="current-password"><button>Sign in</button></form></div>`);
+  return consoleLayout("Sign in", null, flash, `<h1>Sign in</h1><p class="sub">Paste the staff access token you were given. It is stored only as a secure cookie on this browser for 12 hours.</p><form method="post" action="/admin/login"><label for="token">Access token</label><input id="token" name="token" type="password" required autocomplete="current-password"><button>Sign in</button></form>`);
 }
 
 export function boxesHtml(identity: ConsoleIdentity, boxes: StaffBoxOverview[], query: string, flash: Flash): string {
   const rows = boxes.map((box) => `<tr><td><a href="${boxHref(box.boxNumber)}">${e(box.boxNumber)}</a></td><td class="mono">${e(box.trailCode)}</td><td>${box.depth === 0 ? "Starter" : `Gen ${box.depth + 1}`}${box.parentBoxNumber ? ` <span class="muted">from ${e(box.parentBoxNumber)}</span>` : ""}</td><td>${pill(box.fulfilmentStatus)}</td><td>${e(recipientLabels[box.recipientStatus])}</td><td class="mono">${e(box.cardCode ?? "—")}</td><td>${e(when(box.createdAt))}</td></tr>`).join("");
   const toPack = boxes.filter((box) => box.fulfilmentStatus === "paid").length, inTransit = boxes.filter((box) => box.fulfilmentStatus === "packed" || box.fulfilmentStatus === "collected").length, delivered = boxes.filter((box) => box.fulfilmentStatus === "delivered").length;
   const start = identity.role === "admin" ? `<form method="post" action="/admin/boxes"><button>Start a new trail</button></form>` : "";
-  return consoleLayout("Boxes", identity, flash, `<div style="display:flex;justify-content:space-between;align-items:flex-start"><div><h1>Boxes</h1><p class="sub">${query ? `Results for “${e(query)}”.` : "Most recent 50 boxes."} Contact details never appear here.</p></div>${start}</div>
+  return consoleLayout("Boxes", identity, flash, `<div class="pagehead"><div><h1>Boxes</h1><p class="sub">${query ? `Results for “${e(query)}”.` : "Most recent 50 boxes."} Contact details never appear here.</p></div>${start}</div>
 ${query ? "" : `<div class="stats"><div class="stat"><b>${toPack}</b>To pack</div><div class="stat"><b>${inTransit}</b>Packed or with courier</div><div class="stat"><b>${delivered}</b>Delivered</div></div>`}
 <div class="panel"><form method="get" action="/admin/boxes" class="inline"><input name="query" value="${e(query)}" placeholder="Box number or trail code, e.g. GS-00012" aria-label="Search boxes" minlength="2"><button class="secondary">Search</button>${query ? `<a href="/admin/boxes">Clear</a>` : ""}</form></div>
 <div class="panel">${boxes.length ? `<table><thead><tr><th>Box</th><th>Trail</th><th>Place</th><th>Fulfilment</th><th>Recipient</th><th>Card</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="empty">No boxes yet.${identity.role === "admin" ? " Start a new trail to create the first one." : ""}</p>`}</div>`);
@@ -116,7 +94,6 @@ export function printSheetHtml(identity: ConsoleIdentity, cards: PrintableCard[]
   const sheet = cards.map((card) => `<article class="printcard"><div class="pc-brand">✦ Gratitude Stories</div><div class="qr">${card.qrSvg}</div><p class="pc-cta">Scan when your box arrives</p><p class="pc-code">${e(card.cardCode)}</p></article>`).join("");
   return consoleLayout("Print cards", identity, {}, `<style>
 .sheet{display:grid;grid-template-columns:repeat(3,1fr);gap:0}.printcard{display:flex;flex-direction:column;align-items:center;justify-content:center;height:88mm;padding:6mm;border:1px dashed #cfc6e0;background:#fff;text-align:center;break-inside:avoid}.pc-brand{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#5c3f92}.qr{width:42mm;height:42mm;margin:5mm 0 3mm}.qr svg{width:100%;height:100%}.pc-cta{margin:0;font-weight:700}.pc-code{margin:4px 0 0;font:12px ui-monospace,Menlo,monospace;color:#6d6681}
-@media print{header,.noprint,.flash{display:none!important}body{background:#fff}main{max-width:none;padding:0}@page{size:A4;margin:8mm}}
 </style><div class="noprint"><h1>Print ${cards.length} card${cards.length === 1 ? "" : "s"}</h1><p class="flash bad">Print this page now (or save it as PDF). It will not be shown again, and refreshing it would issue another batch.</p><p class="sub">Cut along the dashed lines. Each card opens a box only after it is bound to that box at packing. <a href="/admin/cards">Back to cards</a></p><p><b>Print with ⌘P (Mac) or Ctrl+P (Windows).</b> Choose A4, 100% scale, and turn off headers and footers.</p></div><div class="sheet">${sheet}</div>`);
 }
 

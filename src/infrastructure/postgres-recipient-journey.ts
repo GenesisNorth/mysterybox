@@ -11,6 +11,7 @@ import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.j
 import type { DeliverableReminder, ReminderDeliveryStore } from "../application/reminders.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
 import type { ErasureSubject, PrivacyRepository, PurgeResult } from "../application/privacy.js";
+import { emptyPipeline, type AnalyticsRepository, type DashboardAnalytics } from "../application/analytics.js";
 import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
 type BoxRow = {
@@ -20,7 +21,7 @@ type BoxRow = {
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
-export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository {
+export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository, AnalyticsRepository {
   constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
@@ -437,6 +438,61 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       await client.query("COMMIT"); return true;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
+  // --- Dashboard analytics (aggregates only; no personal data) ---
+  async dashboardAnalytics(): Promise<DashboardAnalytics> {
+    const one = async <T>(sql: string): Promise<T> => (await this.pool.query(sql)).rows[0] as T;
+    const many = async <T>(sql: string): Promise<T[]> => (await this.pool.query(sql)).rows as T[];
+    const n = (value: unknown) => Number(value ?? 0);
+    const [totals, pipelineRows, journey, weekly, generations, attention, activity] = await Promise.all([
+      one<Record<string, string | null>>(`SELECT
+        (SELECT count(*) FROM boxes) boxes,
+        (SELECT count(*) FROM trails) trails,
+        (SELECT count(DISTINCT trail_id) FROM boxes WHERE created_at > now() - interval '30 days') active_trails,
+        (SELECT count(*) FROM boxes WHERE fulfilment_status = 'delivered') delivered,
+        (SELECT count(*) FROM boxes p WHERE EXISTS (SELECT 1 FROM boxes c WHERE c.parent_box_id = p.id)) passed_on,
+        (SELECT COALESCE(sum(amount_kobo), 0) FROM orders WHERE status = 'paid') revenue_kobo,
+        (SELECT COALESCE(max(depth) + 1, 0) FROM boxes) longest_trail,
+        (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM delivered_at - paid_at) / 3600)
+           FROM boxes WHERE delivered_at IS NOT NULL AND paid_at IS NOT NULL AND delivered_at > now() - interval '90 days') median_hours`),
+      many<{ status: keyof DashboardAnalytics["pipeline"]; count: string }>(`SELECT fulfilment_status::text status, count(*) FROM boxes GROUP BY 1`),
+      one<Record<string, string>>(`SELECT count(*) delivered,
+        count(*) FILTER (WHERE recipient_status <> 'unknown') opened,
+        count(*) FILTER (WHERE recipient_status IN ('confirmed', 'registered', 'decided')) received,
+        count(*) FILTER (WHERE recipient_status = 'decided' OR EXISTS (SELECT 1 FROM boxes c WHERE c.parent_box_id = b.id)) decided,
+        count(*) FILTER (WHERE EXISTS (SELECT 1 FROM boxes c WHERE c.parent_box_id = b.id)) passed_on
+        FROM boxes b WHERE fulfilment_status = 'delivered'`),
+      many<{ week_start: Date; created: string; delivered: string }>(`WITH weeks AS (
+          SELECT generate_series(date_trunc('week', now() AT TIME ZONE 'Africa/Lagos') - interval '11 weeks', date_trunc('week', now() AT TIME ZONE 'Africa/Lagos'), interval '1 week') week_start)
+        SELECT w.week_start,
+          (SELECT count(*) FROM boxes b WHERE b.created_at AT TIME ZONE 'Africa/Lagos' >= w.week_start AND b.created_at AT TIME ZONE 'Africa/Lagos' < w.week_start + interval '1 week') created,
+          (SELECT count(*) FROM boxes b WHERE b.delivered_at AT TIME ZONE 'Africa/Lagos' >= w.week_start AND b.delivered_at AT TIME ZONE 'Africa/Lagos' < w.week_start + interval '1 week') delivered
+        FROM weeks w ORDER BY w.week_start`),
+      many<{ generation: number; boxes: string }>(`SELECT depth + 1 generation, count(*) boxes FROM boxes GROUP BY depth ORDER BY depth`),
+      one<{ overdue: string; open_help: string; oldest_help: Date | null; cards: string; reminders: string }>(`SELECT
+        (SELECT count(*) FROM boxes WHERE fulfilment_status = 'paid' AND COALESCE(paid_at, created_at) < now() - interval '1 day') overdue,
+        (SELECT count(*) FROM help_requests WHERE status = 'open') open_help,
+        (SELECT min(created_at) FROM help_requests WHERE status = 'open') oldest_help,
+        (SELECT count(*) FROM box_cards WHERE status = 'available') cards,
+        (SELECT count(*) FROM pass_forward_reminders WHERE status = 'scheduled' AND send_at <= now()) reminders`),
+      many<{ actor: string; action: string; box_number: string | null; occurred_at: Date }>(`SELECT e.actor, e.action, b.box_number, e.occurred_at
+        FROM staff_audit_events e LEFT JOIN boxes b ON e.target_type = 'boxes' AND b.id::text = e.target_id
+        WHERE e.actor NOT IN ('system', 'public', 'retention-cleanup', 'reminder-email-sender')
+        ORDER BY e.occurred_at DESC LIMIT 10`)
+    ]);
+    const pipeline = emptyPipeline();
+    for (const row of pipelineRows) pipeline[row.status] = n(row.count);
+    return {
+      generatedAt: new Date(),
+      totals: { boxes: n(totals.boxes), trails: n(totals.trails), activeTrails: n(totals.active_trails), delivered: n(totals.delivered), passedOn: n(totals.passed_on), revenueKobo: n(totals.revenue_kobo), longestTrail: n(totals.longest_trail), medianFulfilmentHours: totals.median_hours === null ? null : Number(totals.median_hours) },
+      pipeline,
+      journey: { delivered: n(journey.delivered), opened: n(journey.opened), received: n(journey.received), decided: n(journey.decided), passedOn: n(journey.passed_on) },
+      weekly: weekly.map((row) => ({ weekStart: row.week_start, created: n(row.created), delivered: n(row.delivered) })),
+      generations: generations.map((row) => ({ generation: n(row.generation), boxes: n(row.boxes) })),
+      attention: { overdueToPack: n(attention.overdue), openHelp: n(attention.open_help), oldestHelpAt: attention.oldest_help, cardsInStock: n(attention.cards), remindersDue: n(attention.reminders) },
+      recentActivity: activity.map((row) => ({ actor: row.actor, action: row.action, boxNumber: row.box_number, occurredAt: row.occurred_at }))
+    };
+  }
+
   // --- Data retention ---
   async purgeExpiredSecrets(graceDays: number): Promise<PurgeResult> {
     const before = `now() - make_interval(days => $1)`;

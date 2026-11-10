@@ -5,6 +5,7 @@ import test from "node:test";
 import type { StaffOperations } from "../application/staff-operations.js";
 import { handleAdmin, type StaffIdentity } from "./admin.js";
 import { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
+import { emptyPipeline, type AnalyticsRepository, type DashboardAnalytics } from "../application/analytics.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "../infrastructure/in-memory-recipient-journey.js";
 
 const support = new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
@@ -19,10 +20,22 @@ const staff = {
   createStarterBox: async () => { calls.push("starter"); return { boxNumber: "GS-00009", trailCode: "TRAIL-X" }; },
   recordPacking: async () => { calls.push("pack"); throw new Error("Packing checklist must be complete"); }
 } as unknown as StaffOperations;
+const sampleAnalytics: DashboardAnalytics = {
+  generatedAt: new Date("2026-11-10T12:00:00Z"),
+  totals: { boxes: 14, trails: 3, activeTrails: 2, delivered: 8, passedOn: 5, revenueKobo: 4_500_000, longestTrail: 4, medianFulfilmentHours: 60 },
+  pipeline: { ...emptyPipeline(), paid: 2, packed: 1, delivered: 8, cancelled: 1, created: 2 },
+  journey: { delivered: 8, opened: 7, received: 7, decided: 6, passedOn: 5 },
+  weekly: Array.from({ length: 12 }, (_, index) => ({ weekStart: new Date(Date.UTC(2026, 7, 24 + index * 7)), created: index % 3, delivered: index % 2 })),
+  generations: [{ generation: 1, boxes: 3 }, { generation: 2, boxes: 6 }, { generation: 3, boxes: 4 }, { generation: 4, boxes: 1 }],
+  attention: { overdueToPack: 1, openHelp: 2, oldestHelpAt: new Date("2026-11-08T12:00:00Z"), cardsInStock: 9, remindersDue: 3 },
+  recentActivity: [{ actor: "ops@example.com", action: "packing_records.insert", boxNumber: "GS-<00012>", occurredAt: new Date("2026-11-10T11:30:00Z") }]
+};
+let analyticsFails = false;
+const analytics: AnalyticsRepository = { dashboardAnalytics: async () => { if (analyticsFails) throw new Error("database down"); return sampleAnalytics; } };
 
 async function withServer(run: (base: string) => Promise<void>, production = false): Promise<void> {
   const server: Server = createServer(async (request, response) => {
-    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), retention: null, automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
+    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), retention: null, analytics, automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -135,4 +148,21 @@ test("only administrators can open or change staff accounts", () => withServer(a
 test("only administrators can erase personal details, and only with confirmation", () => withServer(async (base) => {
   assert.match(flashOf(await post(base, "/admin/boxes/GS-00001/erase", { subject: "recipient", confirm: "yes" }, as("ops-token"))).error ?? "", /Only an administrator/);
   assert.match(flashOf(await post(base, "/admin/boxes/GS-00001/erase", { subject: "recipient" }, as("admin-token"))).error ?? "", /needs the database|confirm/);
+}));
+
+test("signing in lands on the overview: sidebar navigation, attention cards, charts and activity", () => withServer(async (base) => {
+  assert.equal((await post(base, "/admin/login", { token: "admin-token" })).headers.get("location"), "/admin");
+  const page = await (await fetch(`${base}/admin`, { headers: as("admin-token") })).text();
+  assert.match(page, /<aside class="side">/); assert.match(page, /<a href="\/admin" aria-current="page">/);
+  for (const text of ["Paid boxes waiting over a day", "Open help requests", "Reminders due to send", "Printed cards in stock", "Pass-forward rate", "63%", "₦45,000", "2.5 days", "New boxes per week", "Where every box is", "Recipient journey", "How far trails reach", "Recorded packing", "Show as table"]) assert.ok(page.includes(text), text);
+  assert.ok(page.includes("GS-&lt;00012&gt;") && !page.includes("GS-<00012>"), "values are escaped");
+  assert.ok(!page.includes("<header>"), "the old top navigation is gone");
+}));
+
+test("operations staff see the overview without reminders or staff links; a failed load still renders", () => withServer(async (base) => {
+  const page = await (await fetch(`${base}/admin`, { headers: as("ops-token") })).text();
+  assert.ok(page.includes("Open help requests")); assert.ok(!page.includes("Reminders due to send")); assert.ok(!page.includes('href="/admin/staff"')); assert.ok(!page.includes('href="/admin/reminders"'));
+  analyticsFails = true;
+  try { const failed = await fetch(`${base}/admin`, { headers: as("admin-token") }); assert.equal(failed.status, 200); assert.match(await failed.text(), /could not be loaded/); }
+  finally { analyticsFails = false; }
 }));

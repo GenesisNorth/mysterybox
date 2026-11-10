@@ -125,7 +125,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     catch { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "not-ready" })); }
     return;
   }
-  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, retention: dataRetention, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
+  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, retention: dataRetention, analytics: postgresRepository ?? null, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
   if (pathname.startsWith("/staff/")) {
     if (!staffOperations) { json(response, 503, { error: "Staff operations require PostgreSQL" }); return; }
     const identity = await staffIdentity(request);

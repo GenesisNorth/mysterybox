@@ -3,6 +3,8 @@ import QRCode from "qrcode";
 import type { StaffOperations } from "../application/staff-operations.js";
 import type { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
 import type { DataRetention } from "../application/privacy.js";
+import type { AnalyticsRepository } from "../application/analytics.js";
+import { dashboardHtml } from "./admin-dashboard.js";
 import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, staffHtml, staffTokenHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
 import { cookieValue, formValues, isSameOrigin } from "./http.js";
 import { setActor } from "../infrastructure/actor-context.js";
@@ -14,6 +16,8 @@ export interface AdminDependencies {
   reminders: PassForwardReminders;
   recovery: HolderRecovery;
   retention: DataRetention | null;
+  /** Aggregate numbers for the Overview page. */
+  analytics: AnalyticsRepository | null;
   /** An email provider is connected, so email reminders are sent automatically. */
   automaticEmail: boolean;
   identify(token: string | undefined): Promise<StaffIdentity | null>;
@@ -55,7 +59,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     if (request.method === "POST") {
       const token = (await formValues(request)).get("token")?.trim();
       if (!await deps.identify(token)) { html(response, 401, loginHtml({ error: "That token was not recognised, or it has been revoked." })); return true; }
-      redirect(response, "/admin/boxes", {}, { "set-cookie": `${cookieName}=${encodeURIComponent(token!)}; HttpOnly${secure}; SameSite=Strict; Path=/admin; Max-Age=${sessionSeconds}` });
+      redirect(response, "/admin", {}, { "set-cookie": `${cookieName}=${encodeURIComponent(token!)}; HttpOnly${secure}; SameSite=Strict; Path=/admin; Max-Age=${sessionSeconds}` });
       return true;
     }
   }
@@ -71,7 +75,9 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   const admin = identity.role === "admin";
   const requireAdmin = () => { if (!admin) throw new Error("Only an administrator can do that"); };
 
-  if (path === "/admin" || path === "/admin/") { redirect(response, "/admin/boxes"); return true; }
+  if ((path === "/admin" || path === "/admin/") && request.method === "GET") {
+    html(response, 200, dashboardHtml(identity, deps.analytics ? await orNull(() => deps.analytics!.dashboardAnalytics()) : null, flash)); return true;
+  }
 
   if (path === "/admin/boxes") {
     if (request.method === "GET") {
