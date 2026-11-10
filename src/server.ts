@@ -3,6 +3,7 @@ import { runWithActor, setActor } from "./infrastructure/actor-context.js";
 import { emailSenderFromEnvironment } from "./infrastructure/email.js";
 import { projectPath } from "./infrastructure/project-root.js";
 import { productionConfigProblems } from "./infrastructure/production-config.js";
+import { DataRetention } from "./application/privacy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { RecipientJourney, type RecipientJourneyRepository } from "./application/recipient-journey.js";
@@ -41,6 +42,7 @@ const myStories = new MyStories(repository);
 const helpDesk = new HelpDesk(repository);
 const passForwardReminders = new PassForwardReminders(repository);
 const holderRecovery = new HolderRecovery(repository);
+const dataRetention = postgresRepository ? new DataRetention(postgresRepository) : null;
 /** Optional WhatsApp support number in international format without "+", e.g. 2348030000000. */
 const supportWhatsapp = process.env.SUPPORT_WHATSAPP_NUMBER?.replace(/\D/g, "") || null;
 const production = process.env.NODE_ENV === "production";
@@ -123,7 +125,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     catch { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "not-ready" })); }
     return;
   }
-  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
+  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, retention: dataRetention, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
   if (pathname.startsWith("/staff/")) {
     if (!staffOperations) { json(response, 503, { error: "Staff operations require PostgreSQL" }); return; }
     const identity = await staffIdentity(request);
@@ -502,10 +504,23 @@ async function dispatchReminderEmails(): Promise<void> {
 if (emailSender && !reminderBaseUrl) console.warn(JSON.stringify({ event: "reminders.email.disabled", reason: "PUBLIC_BASE_URL is not set" }));
 const reminderTimer = emailSender && reminderBaseUrl ? setInterval(() => void dispatchReminderEmails(), 60_000) : null;
 reminderTimer?.unref();
+
+// Data retention: every 6 hours, delete single-use secrets that expired more than 7 days ago.
+async function purgeExpiredSecrets(): Promise<void> {
+  if (!dataRetention) return;
+  try {
+    const purged = await runWithActor("retention-cleanup", () => dataRetention.purge());
+    if (Object.values(purged).some((count) => count > 0)) console.info(JSON.stringify({ event: "retention.purge", ...purged }));
+  } catch { console.error(JSON.stringify({ event: "retention.purge.error" })); }
+}
+const retentionTimer = dataRetention ? setInterval(() => void purgeExpiredSecrets(), 6 * 60 * 60 * 1000) : null;
+retentionTimer?.unref();
+if (dataRetention) setTimeout(() => void purgeExpiredSecrets(), 60_000).unref();
 async function shutdown(signal: string): Promise<void> {
   console.info(JSON.stringify({ event: "shutdown", signal }));
   const forceExit = setTimeout(() => process.exit(1), 10_000);
   if (reminderTimer) clearInterval(reminderTimer);
+  if (retentionTimer) clearInterval(retentionTimer);
   server.close(async () => { clearTimeout(forceExit); if (postgresRepository) await postgresRepository.close(); process.exit(0); });
 }
 process.once("SIGTERM", () => void shutdown("SIGTERM"));

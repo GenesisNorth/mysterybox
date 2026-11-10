@@ -118,7 +118,13 @@ On `SIGTERM` or `SIGINT`, the service stops accepting connections and closes its
 Production startup requires `DATABASE_URL`; holder and tracker cookies are marked `Secure` automatically in production.
 Set `TRUST_PROXY=true` only when a trusted reverse proxy sets `X-Forwarded-For`; this lets request throttling distinguish clients behind that proxy.
 
-GitHub Actions runs `npm ci`, migrations (twice, to prove they are repeatable), type-checking, and the full test suite on every push and pull request, including the PostgreSQL integration tests. Run those locally against a migrated database with `TEST_DATABASE_URL=postgres://… npm test`; they use random identifiers, so the same database can be reused.
+GitHub Actions runs `npm ci`, migrations (twice, to prove they are repeatable), type-checking, and the full test suite on every push and pull request, including the PostgreSQL integration tests. Run those locally against a **separate, migrated test database** (they leave test boxes behind, so never point them at a database you use), e.g. `TEST_DATABASE_URL=postgres://gratitude:gratitude@localhost:55433/gratitude_test npm test`. They use random identifiers, so the same test database can be reused.
+
+## Data retention
+
+Every 6 hours the server deletes single-use secrets that expired more than 7 days ago: phone sessions, My Stories sign-in links and sessions, recovery links, and referral links that never became an order. For “delete my details” requests, an administrator can erase the recipient's or the giver's personal data from a delivered, cancelled or refunded box (name, contacts, delivery address, reminder and help contacts; for a recipient also the name they typed when passing forward). The trail keeps its shape and shows them as “A friend”, and the erasure is recorded in the history. **Payment records, including the buyer's email, are kept** for financial record-keeping; confirm that policy and all retention periods in the privacy/legal review before the pilot.
+
+Day-to-day operations are described for the fulfilment team in [docs/pilot-runbook.md](docs/pilot-runbook.md).
 
 ## Email
 

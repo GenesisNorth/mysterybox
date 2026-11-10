@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import QRCode from "qrcode";
 import type { StaffOperations } from "../application/staff-operations.js";
 import type { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
+import type { DataRetention } from "../application/privacy.js";
 import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, staffHtml, staffTokenHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
 import { cookieValue, formValues, isSameOrigin } from "./http.js";
 import { setActor } from "../infrastructure/actor-context.js";
@@ -12,6 +13,7 @@ export interface AdminDependencies {
   helpDesk: HelpDesk;
   reminders: PassForwardReminders;
   recovery: HolderRecovery;
+  retention: DataRetention | null;
   /** An email provider is connected, so email reminders are sent automatically. */
   automaticEmail: boolean;
   identify(token: string | undefined): Promise<StaffIdentity | null>;
@@ -85,7 +87,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     }
   }
 
-  const boxRoute = path.match(/^\/admin\/boxes\/([^/]+)(?:\/(advance|card|replace-card|pack|collect|deliver|delivery|participants|recovery-link))?$/);
+  const boxRoute = path.match(/^\/admin\/boxes\/([^/]+)(?:\/(advance|card|replace-card|pack|collect|deliver|delivery|participants|recovery-link|erase))?$/);
   if (boxRoute?.[1]) {
     const boxNumber = decodeURIComponent(boxRoute[1]); const action = boxRoute[2];
     const back = `/admin/boxes/${encodeURIComponent(boxNumber)}`;
@@ -104,6 +106,17 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
         helpRequests: await deps.helpDesk.requestsForBox(boxNumber)
       };
       html(response, 200, boxDetailHtml(identity, detail, flash)); return true;
+    }
+    if (request.method === "POST" && action === "erase") {
+      try {
+        requireAdmin();
+        if (!deps.retention) throw new Error("Erasure needs the database");
+        const values = await formValues(request);
+        if (values.get("confirm") !== "yes") throw new Error("Tick the box to confirm the erasure");
+        await deps.retention.erase(boxNumber, values.get("subject") ?? "", identity.actor);
+        redirect(response, back, { notice: `The ${values.get("subject")}'s personal details were erased from this box.` });
+      } catch (error) { redirect(response, back, { error: message(error) }); }
+      return true;
     }
     if (request.method === "POST" && action === "recovery-link") {
       try {

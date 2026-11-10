@@ -182,3 +182,70 @@ test("a recovery link ends other holder sessions in the same transaction and is 
   const actors = (await q(`SELECT e.actor FROM staff_audit_events e JOIN holder_recovery_links l ON l.id::text = e.target_id WHERE l.token_hash = $1 ORDER BY e.occurred_at`, [hash(token)])).rows.map((row) => row.actor);
   assert.deepEqual(actors, ["admin@example.com", "public"]);
 });
+
+test("an unattributed write on a connection that was attributed earlier is recorded as 'system', never blank", { skip }, async () => {
+  const client = new pg.Client({ connectionString: url }); await client.connect();
+  try {
+    const code = `TRAIL-${unique()}`;
+    await client.query("BEGIN"); await client.query("SELECT set_config('app.actor', 'ops@example.com', true)"); await client.query("COMMIT");
+    const id = (await client.query(`INSERT INTO trails (code) VALUES ($1) RETURNING id`, [code])).rows[0].id;
+    const boxId = (await client.query(`INSERT INTO boxes (box_number, trail_id, depth) VALUES ($1, $2, 0) RETURNING id`, [`GS-T${unique()}`, id])).rows[0].id;
+    assert.equal((await client.query(`SELECT actor FROM staff_audit_events WHERE target_id = $1`, [boxId])).rows[0]?.actor, "system");
+  } finally { await client.end(); }
+});
+
+test("erasing a recipient's details removes their personal data but keeps the trail; finished boxes only", { skip }, async () => {
+  const { repo, q } = db(); const { DataRetention } = await import("../application/privacy.js");
+  const retention = new DataRetention(repo); const journey = new RecipientJourney(repo); const pif = new PassItForward(repo);
+  const t = await trail(); const card = `card-${unique()}`; const id = await box(t, { card });
+  const { sessionToken } = await journey.confirm(card);
+  await journey.registerProfile(card, sessionToken, { firstName: "Ade", lastInitial: "O", area: "Yaba", displayConsent: true });
+  const boxNumber = (await repo.findByCardToken(card))!.boxNumber;
+  await q(`INSERT INTO delivery_details (box_id, address_line_1, city, contact_name, contact_phone) VALUES ($1, '12 Market Road', 'Lagos', 'Ade', '0803 000 0000')`, [id]);
+  await new HelpDesk(repo).submit(card, { category: "other", message: "My number is 0803", contact: "ade@example.com" });
+  await new PassForwardReminders(repo).request(card, sessionToken, { channel: "email", destination: "ade@example.com", consent: true });
+  const { referralToken } = await pif.begin(card, sessionToken);
+  const child = await repo.markPaidAndCreateChild((await pif.createOrder(referralToken, checkout({ giverName: "Ade" }))).paymentReference);
+
+  await runWithActor("admin@example.com", () => retention.erase(boxNumber, "recipient", "admin@example.com"));
+  const person = (await q(`SELECT p.* FROM participants p JOIN boxes b ON b.recipient_participant_id = p.id WHERE b.id = $1`, [id])).rows[0];
+  assert.deepEqual([person.first_name, person.last_initial, person.area, person.email, person.phone, person.display_consent], [null, null, null, null, null, false]);
+  const label = (await q(`SELECT address_line_1, contact_name, contact_phone FROM delivery_details WHERE box_id = $1`, [id])).rows[0];
+  assert.deepEqual(label, { address_line_1: "[erased]", contact_name: null, contact_phone: null });
+  assert.equal((await q(`SELECT destination FROM pass_forward_reminders WHERE box_id = $1`, [id])).rows[0].destination, "[erased]");
+  assert.deepEqual((await q(`SELECT message, contact FROM help_requests WHERE box_id = $1`, [id])).rows[0], { message: null, contact: null });
+  assert.equal((await q(`SELECT giver_display_name FROM boxes WHERE id = $1`, [child.childBoxId])).rows[0].giver_display_name, null);
+  assert.equal((await q(`SELECT trail_id FROM boxes WHERE id = $1`, [child.childBoxId])).rows[0].trail_id, t, "the trail keeps its shape");
+  assert.equal((await q(`SELECT count(*)::int n FROM orders WHERE child_box_id = $1 AND customer_email <> ''`, [child.childBoxId])).rows[0].n, 1, "payment records are kept");
+  const event = (await q(`SELECT actor, metadata FROM staff_audit_events WHERE action = 'personal_data.erase' AND target_id = $1`, [id])).rows[0];
+  assert.deepEqual(event, { actor: "admin@example.com", metadata: { subject: "recipient" } });
+
+  const inFlight = await box(t, { fulfilment: "packed" });
+  const inFlightNumber = (await q(`SELECT box_number FROM boxes WHERE id = $1`, [inFlight])).rows[0].box_number;
+  await assert.rejects(() => retention.erase(inFlightNumber, "recipient", "admin@example.com"), /delivered, cancelled or refunded/);
+});
+
+test("erasing a giver removes their name and note from the box", { skip }, async () => {
+  const { q, repo } = db(); const { DataRetention } = await import("../application/privacy.js");
+  const t = await trail(); const id = await box(t, { giver: await person("Teni") });
+  await q(`UPDATE boxes SET giver_note = 'For every Sunday', giver_display_name = 'Teni' WHERE id = $1`, [id]);
+  const boxNumber = (await q(`SELECT box_number FROM boxes WHERE id = $1`, [id])).rows[0].box_number;
+  await new DataRetention(repo).erase(boxNumber, "giver", "admin@example.com");
+  const row = (await q(`SELECT b.giver_note, b.giver_display_name, p.first_name FROM boxes b JOIN participants p ON p.id = b.giver_participant_id WHERE b.id = $1`, [id])).rows[0];
+  assert.deepEqual(row, { giver_note: null, giver_display_name: null, first_name: null });
+});
+
+test("expired secrets are purged after the grace period; referrals that became orders are kept", { skip }, async () => {
+  const { q, repo } = db(); const { DataRetention } = await import("../application/privacy.js");
+  const t = await trail(); const id = await box(t);
+  const old = `now() - interval '10 days'`;
+  await q(`INSERT INTO holder_sessions (box_id, token_hash, expires_at) VALUES ($1, $2, ${old}), ($1, $3, now() + interval '1 day')`, [id, `h-${unique()}`, `h-${unique()}`]);
+  const unused = (await q(`INSERT INTO referrals (parent_box_id, token_hash, expires_at) VALUES ($1, $2, ${old}) RETURNING id`, [id, `r-${unique()}`])).rows[0].id;
+  const ordered = (await q(`INSERT INTO referrals (parent_box_id, token_hash, expires_at) VALUES ($1, $2, ${old}) RETURNING id`, [id, `r-${unique()}`])).rows[0].id;
+  await q(`INSERT INTO orders (reference, referral_id, trail_id, parent_box_id, amount_kobo, customer_email, status) VALUES ($1, $2, $3, $4, 100, 'x@example.com', 'pending_payment')`, [`ORD-${unique()}`, ordered, t, id]);
+  const result = await new DataRetention(repo).purge(7);
+  assert.ok(result.holderSessions >= 1 && result.referrals >= 1);
+  assert.equal((await q(`SELECT count(*)::int n FROM holder_sessions WHERE box_id = $1`, [id])).rows[0].n, 1, "the live session survives");
+  assert.equal((await q(`SELECT count(*)::int n FROM referrals WHERE id = $1`, [unused])).rows[0].n, 0);
+  assert.equal((await q(`SELECT count(*)::int n FROM referrals WHERE id = $1`, [ordered])).rows[0].n, 1);
+});

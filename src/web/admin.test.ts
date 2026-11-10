@@ -22,7 +22,7 @@ const staff = {
 
 async function withServer(run: (base: string) => Promise<void>, production = false): Promise<void> {
   const server: Server = createServer(async (request, response) => {
-    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
+    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), retention: null, automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -130,4 +130,9 @@ test("only administrators can open or change staff accounts", () => withServer(a
   assert.equal((await fetch(`${base}/admin/staff`, { headers: as("ops-token") })).status, 403);
   assert.equal((await post(base, "/admin/staff", { email: "x@example.com", role: "admin" }, as("ops-token"))).status, 403);
   assert.equal((await post(base, "/admin/staff/ops%40example.com/revoke", { confirm: "yes" }, as("ops-token"))).status, 403);
+}));
+
+test("only administrators can erase personal details, and only with confirmation", () => withServer(async (base) => {
+  assert.match(flashOf(await post(base, "/admin/boxes/GS-00001/erase", { subject: "recipient", confirm: "yes" }, as("ops-token"))).error ?? "", /Only an administrator/);
+  assert.match(flashOf(await post(base, "/admin/boxes/GS-00001/erase", { subject: "recipient" }, as("admin-token"))).error ?? "", /needs the database|confirm/);
 }));

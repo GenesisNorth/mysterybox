@@ -10,6 +10,7 @@ import type { AuditEvent, BoxParticipantIntake, CardStatus, CollectionRecord, De
 import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.js";
 import type { DeliverableReminder, ReminderDeliveryStore } from "../application/reminders.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
+import type { ErasureSubject, PrivacyRepository, PurgeResult } from "../application/privacy.js";
 import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
 type BoxRow = {
@@ -19,7 +20,7 @@ type BoxRow = {
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
-export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository {
+export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository {
   constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
@@ -436,6 +437,43 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       await client.query("COMMIT"); return true;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
+  // --- Data retention ---
+  async purgeExpiredSecrets(graceDays: number): Promise<PurgeResult> {
+    const before = `now() - make_interval(days => $1)`;
+    const run = async (sql: string) => (await this.pool.query(sql, [graceDays])).rowCount ?? 0;
+    return {
+      holderSessions: await run(`DELETE FROM holder_sessions WHERE expires_at < ${before}`),
+      storySessions: await run(`DELETE FROM story_sessions WHERE expires_at < ${before}`),
+      storyLinks: await run(`DELETE FROM story_magic_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`),
+      referrals: await run(`DELETE FROM referrals r WHERE r.expires_at < ${before} AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.referral_id = r.id)`),
+      recoveryLinks: await run(`DELETE FROM holder_recovery_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`)
+    };
+  }
+  async erasePersonalData(boxNumber: string, subject: ErasureSubject, actor: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    const blank = `first_name = NULL, last_initial = NULL, area = NULL, email = NULL, phone = NULL, display_consent = false`;
+    try {
+      await client.query("BEGIN");
+      const box = (await client.query<{ id: string; fulfilment_status: string; giver_participant_id: string | null; recipient_participant_id: string | null }>(`
+        SELECT id, fulfilment_status, giver_participant_id, recipient_participant_id FROM boxes WHERE box_number = $1 FOR UPDATE`, [boxNumber])).rows[0];
+      if (!box || !["delivered", "cancelled", "refunded"].includes(box.fulfilment_status)) { await client.query("ROLLBACK"); return false; }
+      if (subject === "recipient") {
+        if (box.recipient_participant_id) await client.query(`UPDATE participants SET ${blank} WHERE id = $1`, [box.recipient_participant_id]);
+        await client.query(`UPDATE delivery_details SET address_line_1 = '[erased]', address_line_2 = NULL, city = '[erased]', region = NULL, delivery_notes = NULL, contact_name = NULL, contact_phone = NULL, updated_at = now() WHERE box_id = $1`, [box.id]);
+        await client.query(`UPDATE pass_forward_reminders SET destination = '[erased]' WHERE box_id = $1`, [box.id]);
+        await client.query(`UPDATE help_requests SET message = NULL, contact = NULL WHERE box_id = $1`, [box.id]);
+        await client.query(`DELETE FROM story_box_access WHERE box_id = $1`, [box.id]);
+        // The name this person typed when passing their own box forward.
+        await client.query(`UPDATE boxes SET giver_display_name = NULL WHERE parent_box_id = $1`, [box.id]);
+      } else {
+        if (box.giver_participant_id) await client.query(`UPDATE participants SET ${blank} WHERE id = $1`, [box.giver_participant_id]);
+        await client.query(`UPDATE boxes SET giver_display_name = NULL, giver_note = NULL WHERE id = $1`, [box.id]);
+      }
+      await client.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) VALUES ($1, 'personal_data.erase', 'boxes', $2, $3)`, [actor, box.id, JSON.stringify({ subject })]);
+      await client.query("COMMIT"); return true;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
   async markPassForwardReminderSent(id: string): Promise<boolean> {
     const q = await this.pool.query(`UPDATE pass_forward_reminders SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'scheduled'`, [id]);
     return q.rowCount === 1;
