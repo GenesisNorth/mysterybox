@@ -5,7 +5,7 @@ import pg from "pg";
 import { postgresRecipientJourneyRepository, type PostgresRecipientJourneyRepository } from "./postgres-recipient-journey.js";
 import { runWithActor } from "./actor-context.js";
 import { RecipientJourney } from "../application/recipient-journey.js";
-import { PassItForward, type CheckoutInput } from "../application/pass-it-forward.js";
+import { PassItForward, normalizeCheckout, type CheckoutInput } from "../application/pass-it-forward.js";
 import { GiverTracker } from "../application/giver-tracker.js";
 import { StaffOperations } from "../application/staff-operations.js";
 import { HelpDesk, PassForwardReminders } from "../application/support.js";
@@ -84,7 +84,7 @@ test("checkout retries reuse one order with fresh references; payment creates on
 
   const tracker = await new GiverTracker(repo).getPage((first.trackerToken ?? second.trackerToken)!);
   assert.equal(tracker.kind, "tracker");
-  if (tracker.kind === "tracker") assert.deepEqual(tracker.steps.map((step) => step.complete), [true, false, false, false]);
+  if (tracker.kind === "tracker") { assert.deepEqual(tracker.stages.map((stage) => stage.state), ["done", "done", "current", "upcoming", "upcoming"]); assert.equal(tracker.startedTrail, false); }
   await assert.rejects(() => pif.createOrder(referralToken, checkout()), /no longer awaiting payment/);
 });
 
@@ -269,4 +269,24 @@ test("dashboard analytics count boxes, the recipient journey and generations wit
   assert.ok(after.weekly.at(-1)!.created - before.weekly.at(-1)!.created >= 3);
   assert.ok(after.generations.some((row) => row.generation === 2));
   assert.ok(!JSON.stringify(after).includes("Private"), "no names in analytics");
+});
+
+test("a paid starter order creates a new trail and its first box, with the story and delivery label; retries reuse the order", { skip }, async () => {
+  const { q, repo } = db();
+  const token = `starter-${unique()}-${unique()}-${unique()}-${unique()}`;
+  const first = await repo.createPendingStarterOrder(token, { ...normalizeCheckout(checkout()), giverName: "Teni" });
+  assert.ok(first?.trackerToken);
+  const retry = await repo.createPendingStarterOrder(token, { ...normalizeCheckout(checkout()), giverName: "Teni", note: "Updated" });
+  assert.equal(retry?.reference, first!.reference); assert.notEqual(retry?.paymentReference, first!.paymentReference);
+  const paid = await runWithActor("test-payment", () => repo.markPaidAndCreateChild(retry!.paymentReference));
+  assert.equal(paid.alreadyProcessed, false);
+  const box = (await q(`SELECT b.depth, b.parent_box_id, b.fulfilment_status, b.giver_display_name, b.giver_note, b.trail_id, t.code, o.trail_id AS order_trail, o.kind
+    FROM boxes b JOIN trails t ON t.id = b.trail_id JOIN orders o ON o.child_box_id = b.id WHERE b.id = $1`, [paid.childBoxId])).rows[0];
+  assert.deepEqual([box.depth, box.parent_box_id, box.fulfilment_status, box.giver_display_name, box.giver_note, box.kind], [0, null, "paid", "Teni", "Updated", "starter"]);
+  assert.match(box.code, /^TRAIL-[0-9A-F]{12}$/); assert.equal(box.order_trail, box.trail_id);
+  const label = (await q(`SELECT contact_name, city FROM delivery_details WHERE box_id = $1`, [paid.childBoxId])).rows[0];
+  assert.deepEqual([label.contact_name, label.city], ["Ade Okafor", "Lagos"]);
+  assert.equal((await repo.markPaidAndCreateChild(first!.reference)).childBoxId, paid.childBoxId, "a second verified attempt creates nothing new");
+  assert.equal(await repo.createPendingStarterOrder(token, normalizeCheckout(checkout())), null, "a paid order is closed to further checkouts");
+  await assert.rejects(() => q(`INSERT INTO orders (kind, reference, amount_kobo, customer_email, status, parent_box_id) VALUES ('starter', $1, 100, 'a@b.co', 'pending_payment', $2)`, [`ORD-${unique()}`, paid.childBoxId]), /orders_kind_shape/);
 });

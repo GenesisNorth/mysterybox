@@ -187,7 +187,7 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
           const cardUrl = `${base.replace(/\/$/, "")}/b/${encodeURIComponent(card.cardToken)}`;
           return { cardCode: card.cardCode, url: cardUrl, qrSvg: await QRCode.toString(cardUrl, { type: "svg", errorCorrectionLevel: "M", margin: 1 }) };
         }));
-        html(response, 201, printSheetHtml(identity, cards));
+        html(response, 201, printSheetHtml(identity, cards, !deps.production));
       } catch (error) { redirect(response, "/admin/cards", { error: message(error) }); }
       return true;
     }

@@ -75,7 +75,7 @@ export function dashboardHtml(identity: ConsoleIdentity, data: DashboardAnalytic
     [count(totals.activeTrails), "Active trails", `of ${count(totals.trails)} · new box in 30 days`],
     [count(totals.longestTrail), "Longest trail", "generations so far"],
     [duration(totals.medianFulfilmentHours), "Paid → delivered", "median, last 90 days"],
-    [naira(totals.revenueKobo), "Pass-forward sales", "paid online checkouts"]
+    [naira(totals.revenueKobo), "Online sales", "starter and pass-forward orders"]
   ].map(([value, label, note]) => `<div class="stat"><b>${value}</b>${label}<small>${note}</small></div>`).join("");
 
   const weeklyTotal = data.weekly.reduce((sum, week) => sum + week.created, 0);

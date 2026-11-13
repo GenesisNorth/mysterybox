@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "dev:local": "tsx watch --env-file=.env.local src/server.ts",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/src/server.js",
     "db:migrate": "tsx scripts/migrate.ts",

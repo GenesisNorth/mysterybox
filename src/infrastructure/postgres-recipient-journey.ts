@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { ActorAwarePool } from "./actor-context.js";
 import type { RecipientBox, RecipientJourneyRepository, RecipientProfile, TrailMember } from "../application/recipient-journey.js";
@@ -11,6 +12,7 @@ import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.j
 import type { DeliverableReminder, ReminderDeliveryStore } from "../application/reminders.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
 import type { ErasureSubject, PrivacyRepository, PurgeResult } from "../application/privacy.js";
+import type { StartAGiftRepository } from "../application/start-a-gift.js";
 import { emptyPipeline, type AnalyticsRepository, type DashboardAnalytics } from "../application/analytics.js";
 import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
@@ -21,8 +23,8 @@ type BoxRow = {
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
-export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository, AnalyticsRepository {
-  constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number) {}
+export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository, AnalyticsRepository, StartAGiftRepository {
+  constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number, private readonly starterAmountKobo: number = passOnAmountKobo) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
   async close(): Promise<void> { await this.pool.end(); }
@@ -167,6 +169,40 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
 
+  async createPendingStarterOrder(checkoutToken: string, details: CheckoutDetails): Promise<PendingOrder | null> {
+    const detailValues = [details.giverName, details.note, details.deliveryTo, details.deliveryName, details.deliveryPhone, details.addressLine1, details.addressLine2, details.city, details.region, details.deliveryNotes];
+    const tokenHash = hashOpaqueToken(checkoutToken);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = (await client.query<{ id: string; reference: string; status: string }>(`SELECT id, reference, status FROM orders WHERE checkout_token_hash = $1 FOR UPDATE`, [tokenHash])).rows[0];
+      if (existing) {
+        if (existing.status !== "pending_payment") { await client.query("ROLLBACK"); return null; }
+        await client.query(`
+          UPDATE orders SET giver_display_name = $2, gift_note = $3, delivery_to = $4, delivery_name = $5, delivery_phone = $6,
+            delivery_address_line_1 = $7, delivery_address_line_2 = $8, delivery_city = $9, delivery_region = $10, delivery_notes = $11, customer_email = $12
+          WHERE id = $1`, [existing.id, ...detailValues, details.customerEmail]);
+        const paymentReference = createReference("PAY");
+        await client.query(`INSERT INTO payment_attempts (order_id, reference, customer_email) VALUES ($1, $2, $3)`, [existing.id, paymentReference, details.customerEmail]);
+        await client.query("COMMIT");
+        return { reference: existing.reference, paymentReference, status: "pending_payment", trackerToken: null };
+      }
+      const reference = createReference("ORD");
+      const trackerToken = createOpaqueToken();
+      const order = (await client.query<{ id: string }>(`
+        INSERT INTO orders (kind, reference, checkout_token_hash, amount_kobo, currency, customer_email, status,
+          giver_display_name, gift_note, delivery_to, delivery_name, delivery_phone,
+          delivery_address_line_1, delivery_address_line_2, delivery_city, delivery_region, delivery_notes)
+        VALUES ('starter', $1, $2, $3, 'NGN', $4, 'pending_payment', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING id`, [reference, tokenHash, this.starterAmountKobo, details.customerEmail, ...detailValues])).rows[0];
+      if (!order) throw new Error("Order could not be created");
+      await client.query(`INSERT INTO payment_attempts (order_id, reference, customer_email) VALUES ($1, $2, $3)`, [order.id, reference, details.customerEmail]);
+      await client.query(`INSERT INTO giver_trackers (order_id, token_hash) VALUES ($1, $2)`, [order.id, hashOpaqueToken(trackerToken)]);
+      await client.query("COMMIT");
+      return { reference, paymentReference: reference, status: "pending_payment", trackerToken };
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
   /** Looks up by payment-attempt reference; the email to verify against is the one entered for that attempt. */
   async findOrder(reference: string): Promise<PaymentOrder | null> {
     const result = await this.pool.query<PaymentOrder>(`
@@ -179,8 +215,8 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const orderResult = await client.query<{ id: string; parent_box_id: string; child_box_id: string | null; status: string; attempt_id: string }>(`
-        SELECT o.id, o.parent_box_id, o.child_box_id, o.status, a.id AS attempt_id
+      const orderResult = await client.query<{ id: string; kind: "pass_forward" | "starter"; parent_box_id: string | null; child_box_id: string | null; status: string; attempt_id: string }>(`
+        SELECT o.id, o.kind, o.parent_box_id, o.child_box_id, o.status, a.id AS attempt_id
         FROM payment_attempts a JOIN orders o ON o.id = a.order_id WHERE a.reference = $1 FOR UPDATE OF o`, [reference]);
       const order = orderResult.rows[0];
       if (!order) throw new Error("Order not found");
@@ -188,9 +224,17 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       await client.query(`UPDATE payment_attempts SET verified_at = COALESCE(verified_at, now()) WHERE id = $1`, [order.attempt_id]);
       if (order.child_box_id) { await client.query("COMMIT"); return { childBoxId: order.child_box_id, alreadyProcessed: true }; }
       if (order.status !== "pending_payment") throw new Error("Order cannot be completed");
-      const parentResult = await client.query<{ trail_id: string; depth: number; fulfilment_status: string }>(`SELECT trail_id, depth, fulfilment_status FROM boxes WHERE id = $1 FOR KEY SHARE`, [order.parent_box_id]);
-      const parent = parentResult.rows[0];
-      if (!parent || parent.fulfilment_status === "cancelled" || parent.fulfilment_status === "refunded") throw new Error("Parent box cannot be continued");
+      // A starter order begins a new trail; a passed-forward order continues its parent's trail one generation down.
+      let parent: { trail_id: string; depth: number } | undefined;
+      if (order.kind === "starter") {
+        const trail = (await client.query<{ id: string }>(`INSERT INTO trails (code) VALUES ($1) RETURNING id`, [`TRAIL-${randomBytes(6).toString("hex").toUpperCase()}`])).rows[0];
+        if (!trail) throw new Error("Trail could not be created");
+        parent = { trail_id: trail.id, depth: -1 };
+      } else {
+        const parentRow = (await client.query<{ trail_id: string; depth: number; fulfilment_status: string }>(`SELECT trail_id, depth, fulfilment_status FROM boxes WHERE id = $1 FOR KEY SHARE`, [order.parent_box_id])).rows[0];
+        if (!parentRow || parentRow.fulfilment_status === "cancelled" || parentRow.fulfilment_status === "refunded") throw new Error("Parent box cannot be continued");
+        parent = parentRow;
+      }
       const story = (await client.query<{
         giver_display_name: string | null; gift_note: string | null; delivery_to: "giver" | "recipient" | null; delivery_name: string | null; delivery_phone: string | null;
         delivery_address_line_1: string | null; delivery_address_line_2: string | null; delivery_city: string | null; delivery_region: string | null; delivery_notes: string | null;
@@ -209,8 +253,8 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [child.id, story.delivery_address_line_1, story.delivery_address_line_2, story.delivery_city, story.delivery_region, story.delivery_notes, story.delivery_name, story.delivery_phone, story.delivery_to]);
       }
-      await client.query(`UPDATE orders SET status = 'paid', child_box_id = $2 WHERE id = $1`, [order.id, child.id]);
-      await client.query(`INSERT INTO story_box_access (account_id, box_id)
+      await client.query(`UPDATE orders SET status = 'paid', child_box_id = $2, trail_id = $3 WHERE id = $1`, [order.id, child.id, parent.trail_id]);
+      if (order.parent_box_id) await client.query(`INSERT INTO story_box_access (account_id, box_id)
         SELECT access.account_id, $2 FROM story_box_access access WHERE access.box_id = $1
         ON CONFLICT DO NOTHING`, [order.parent_box_id, child.id]);
       await client.query("COMMIT");
@@ -605,17 +649,19 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
   }
 
   async findByTrackerToken(token: string): Promise<GiverTrackingRecord | null> {
-    const result = await this.pool.query<{ reference: string; status: GiverTrackingRecord["orderStatus"]; paid_at: Date | null; packed_at: Date | null; collected_at: Date | null; delivered_at: Date | null }>(`
-      SELECT o.reference, o.status, child.paid_at, child.packed_at, child.collected_at, child.delivered_at
+    const result = await this.pool.query<{ reference: string; status: GiverTrackingRecord["orderStatus"]; kind: string; created_at: Date; paid_at: Date | null; packed_at: Date | null; collected_at: Date | null; delivered_at: Date | null }>(`
+      SELECT o.reference, o.status, o.kind, o.created_at, child.paid_at, child.packed_at, child.collected_at, child.delivered_at
       FROM giver_trackers tracker JOIN orders o ON o.id = tracker.order_id
       LEFT JOIN boxes child ON child.id = o.child_box_id
       WHERE tracker.token_hash = $1`, [hashOpaqueToken(token)]);
     const row = result.rows[0];
-    return row ? { orderReference: row.reference, orderStatus: row.status, paidAt: row.paid_at, packedAt: row.packed_at, collectedAt: row.collected_at, deliveredAt: row.delivered_at } : null;
+    return row ? { orderReference: row.reference, orderStatus: row.status, startedTrail: row.kind === "starter", orderedAt: row.created_at, paidAt: row.paid_at, packedAt: row.packed_at, collectedAt: row.collected_at, deliveredAt: row.delivered_at } : null;
   }
 }
 
-export function postgresRecipientJourneyRepository(databaseUrl: string, passOnAmountKobo: number): PostgresRecipientJourneyRepository {
+/** `starterAmountKobo` is the price of a box that starts a new trail; it defaults to the pass-forward price. */
+export function postgresRecipientJourneyRepository(databaseUrl: string, passOnAmountKobo: number, starterAmountKobo: number = passOnAmountKobo): PostgresRecipientJourneyRepository {
   if (!Number.isInteger(passOnAmountKobo) || passOnAmountKobo <= 0) throw new Error("PASS_ON_AMOUNT_KOBO must be a positive integer");
-  return new PostgresRecipientJourneyRepository(new ActorAwarePool(new Pool({ connectionString: databaseUrl })), passOnAmountKobo);
+  if (!Number.isInteger(starterAmountKobo) || starterAmountKobo <= 0) throw new Error("STARTER_AMOUNT_KOBO must be a positive integer");
+  return new PostgresRecipientJourneyRepository(new ActorAwarePool(new Pool({ connectionString: databaseUrl })), passOnAmountKobo, starterAmountKobo);
 }

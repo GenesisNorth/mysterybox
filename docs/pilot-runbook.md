@@ -18,6 +18,8 @@ Start on the **Overview** page (where you land after signing in). The four cards
 4. **Delivery details**: the address, contact name and phone the courier will use.
 5. Continue with "Packing and shipping" below.
 
+Boxes bought on the website (**Start a gift box**) arrive already **Paid**, as the first box of a new trail, with the giver's message and delivery details filled in. Use **Start a new trail** only for people who paid offline.
+
 Boxes passed forward by recipients arrive already **Paid**, with the giver's message and the delivery details filled in from checkout.
 
 ## Packing and shipping

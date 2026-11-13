@@ -20,6 +20,7 @@ The server refuses to start in production until the required settings are presen
 | `DATABASE_URL` | yes | PostgreSQL connection string (use the host's *internal* URL when it offers one) |
 | `PUBLIC_BASE_URL` | yes | `https://` origin printed on cards, no path. Used in QR codes, reminder and recovery links |
 | `PASS_ON_AMOUNT_KOBO` | yes | Price of a passed-forward box in kobo (₦15,000 = `1500000`) |
+| `STARTER_AMOUNT_KOBO` | no | Price of a box bought from **Start a gift box** (a new trail). Defaults to `PASS_ON_AMOUNT_KOBO` |
 | `STAFF_ADMIN_TOKEN` | yes, at first | 32+ random characters. Lets you sign in once to create named staff accounts; remove it afterwards |
 | `TRUST_PROXY` | behind a proxy | `true` on Render, Railway, Fly and most hosts, so rate limiting sees real visitors |
 | `SUPPORT_WHATSAPP_NUMBER` | optional | Digits only, e.g. `2348030000000`. Shows a WhatsApp button on the help page |

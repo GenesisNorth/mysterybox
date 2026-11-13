@@ -10,10 +10,11 @@ import { RecipientJourney, type RecipientJourneyRepository } from "./application
 import { MyStories, type MyStoriesRepository } from "./application/my-stories.js";
 import { CheckoutValidationError, PassItForward, type PassItForwardRepository } from "./application/pass-it-forward.js";
 import { PaymentConfirmation } from "./application/payment-confirmation.js";
+import { StartAGift, type StartAGiftRepository } from "./application/start-a-gift.js";
 import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
 import { cookieValue, formValue, formValues, rawBody } from "./web/http.js";
 import { handleAdmin, type StaffIdentity } from "./web/admin.js";
-import { checkoutHtml, helpHtml, recoveryHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindDoneHtml, remindersHtml, remindHtml, reminderLinkHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
+import { localPaymentDoneHtml, checkoutHtml, helpHtml, recoveryHtml, homeHtml, pageHtml, paymentCompleteHtml, profileHtml, remindDoneHtml, remindersHtml, remindHtml, reminderLinkHtml, saveStoryHtml, storiesHtml, trackerHtml } from "./web/views.js";
 import { HelpDesk, HolderRecovery, PassForwardReminders, SupportValidationError, type SupportRepository } from "./application/support.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "./infrastructure/in-memory-recipient-journey.js";
 import { postgresRecipientJourneyRepository } from "./infrastructure/postgres-recipient-journey.js";
@@ -28,15 +29,18 @@ if (configProblems.length) {
 }
 const port = Number(process.env.PORT ?? 3000);
 const passOnAmountKobo = Number(process.env.PASS_ON_AMOUNT_KOBO);
+/** The price of a box that starts a new trail; the pass-forward price unless STARTER_AMOUNT_KOBO is set. */
+const starterAmountKobo = process.env.STARTER_AMOUNT_KOBO ? Number(process.env.STARTER_AMOUNT_KOBO) : passOnAmountKobo;
 const postgresRepository = process.env.DATABASE_URL
-  ? postgresRecipientJourneyRepository(process.env.DATABASE_URL, passOnAmountKobo)
+  ? postgresRecipientJourneyRepository(process.env.DATABASE_URL, passOnAmountKobo, starterAmountKobo)
   : null;
 const demoRepository = postgresRepository ? null : new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
-const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository & SupportRepository = postgresRepository ?? demoRepository!;
+const repository: RecipientJourneyRepository & PassItForwardRepository & GiverTrackerRepository & MyStoriesRepository & SupportRepository & StartAGiftRepository = postgresRepository ?? demoRepository!;
 /** The payment simulator exists only for the in-memory demo, never with a database or in production. */
 const demoPayments = demoRepository && process.env.NODE_ENV !== "production" ? demoRepository : null;
 const journey = new RecipientJourney(repository);
 const passItForward = new PassItForward(repository);
+const startAGift = new StartAGift(repository);
 const giverTracker = new GiverTracker(repository);
 const myStories = new MyStories(repository);
 const helpDesk = new HelpDesk(repository);
@@ -53,6 +57,8 @@ function publicBaseUrlFor(request: IncomingMessage): string | null {
   return process.env.PUBLIC_BASE_URL?.replace(/\/$/, "") ?? (production ? null : `http://${request.headers.host}`);
 }
 const paystack = process.env.PAYSTACK_SECRET_KEY ? new PaystackGateway(process.env.PAYSTACK_SECRET_KEY) : null;
+/** Local testing against a database without Paystack: a button marks the order paid. Never in production. */
+const localPayments = postgresRepository && !paystack && process.env.NODE_ENV !== "production" ? postgresRepository : null;
 const paymentConfirmation = paystack && postgresRepository ? new PaymentConfirmation(paystack, postgresRepository) : null;
 const paystackCallbackUrl = process.env.PAYSTACK_CALLBACK_URL;
 if (process.env.NODE_ENV === "production" && !process.env.DATABASE_URL) throw new Error("DATABASE_URL is required in production");
@@ -114,7 +120,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   if (pathname === "/health") { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "ok" })); return; }
   if (pathname === "/favicon.svg") { response.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }); response.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f8d27a"/><stop offset="1" stop-color="#7e5dcc"/></linearGradient></defs><rect width="64" height="64" rx="18" fill="url(#g)"/><path d="M32 14l4.3 13.7L50 32l-13.7 4.3L32 50l-4.3-13.7L14 32l13.7-4.3z" fill="#fff"/></svg>`); return; }
   if (pathname === "/assets/gratitude-gift-hero.jpg") { try { response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "public, max-age=604800, immutable" }); response.end(await readFile(heroImage)); } catch { response.writeHead(404); response.end(); } return; }
-  if (pathname === "/" && request.method === "GET") { response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(homeHtml()); return; }
+  if (pathname === "/" && request.method === "GET") { response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(homeHtml(Boolean(demoRepository))); return; }
   if (pathname === "/metrics") {
     const token = process.env.METRICS_TOKEN; const provided = request.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
     if (!token || !provided || token.length !== provided.length || !timingSafeEqual(Buffer.from(token), Buffer.from(provided))) { response.writeHead(404); response.end(); return; }
@@ -290,6 +296,34 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   if (pathname === "/checkout/complete" && request.method === "GET") {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); response.end(paymentCompleteHtml(cookieValue(request, "giver_tracker"))); return;
   }
+  // "Start a gift box": anyone can buy the first box of a new trail. Same form, payment and tracker as passing a box on.
+  if (pathname === "/start") {
+    if (request.method === "GET") { response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "ready", start: true })); return; }
+    if (request.method === "POST") {
+      let values: Record<string, string> = {};
+      try {
+        values = Object.fromEntries(await formValues(request, 40_000));
+        const field = (name: string) => values[name] ?? "";
+        const order = await startAGift.createOrder(cookieValue(request, "starter_checkout"), {
+          email: field("email"), giverName: field("giverName"), note: field("note"), deliveryTo: field("deliveryTo"),
+          deliveryName: field("deliveryName"), deliveryPhone: field("deliveryPhone"), addressLine1: field("addressLine1"), addressLine2: field("addressLine2"),
+          city: field("city"), region: field("region"), deliveryNotes: field("deliveryNotes")
+        });
+        const cookies = [`starter_checkout=${order.checkoutToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/start; Max-Age=2592000`];
+        if (order.trackerToken) cookies.push(`giver_tracker=${order.trackerToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/checkout; Max-Age=2592000`);
+        if (paystack && postgresRepository && paystackCallbackUrl) {
+          const checkout = await paystack.initialize({ reference: order.paymentReference, email: order.details.customerEmail, amountKobo: starterAmountKobo, callbackUrl: paystackCallbackUrl });
+          response.writeHead(303, { location: checkout.authorizationUrl, "set-cookie": cookies }); response.end(); return;
+        }
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "set-cookie": cookies });
+        response.end(checkoutHtml({ kind: "pending", start: true, reference: order.reference, trackerToken: order.trackerToken, demoPayment: Boolean(demoPayments), localPaymentReference: localPayments ? order.paymentReference : null }));
+      } catch (error) {
+        if (error instanceof CheckoutValidationError) { response.writeHead(422, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "ready", start: true, error: error.message, values })); }
+        else { console.error(JSON.stringify({ event: "starter.order.error" })); response.writeHead(500, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "ready", start: true, error: "Something went wrong saving your order. Please try again.", values })); }
+      }
+      return;
+    }
+  }
   if (pathname === "/checkout") {
     const referralToken = cookieValue(request, "checkout_referral");
     if (request.method === "GET") {
@@ -313,13 +347,23 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
           const checkout = await paystack.initialize({ reference: order.paymentReference, email: order.details.customerEmail, amountKobo: passOnAmountKobo, callbackUrl: paystackCallbackUrl });
           response.writeHead(303, { location: checkout.authorizationUrl, "set-cookie": order.trackerToken ? `giver_tracker=${order.trackerToken}; HttpOnly${secureCookie}; SameSite=Lax; Path=/checkout; Max-Age=2592000` : undefined }); response.end(); return;
         }
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "pending", reference: order.reference, trackerToken: order.trackerToken, demoPayment: Boolean(demoPayments) }));
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "pending", reference: order.reference, trackerToken: order.trackerToken, demoPayment: Boolean(demoPayments), localPaymentReference: localPayments ? order.paymentReference : null }));
       } catch (error) {
         if (error instanceof CheckoutValidationError) { response.writeHead(422, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "ready", error: error.message, values })); }
         else { response.writeHead(404, { "content-type": "text/html; charset=utf-8" }); response.end(checkoutHtml({ kind: "invalid" })); }
       }
       return;
     }
+  }
+  if (pathname === "/demo/pay" && request.method === "POST" && localPayments) {
+    try {
+      const values = await formValues(request);
+      setActor("local-payment-simulator");
+      await localPayments.markPaidAndCreateChild(values.get("reference") ?? "");
+      const tracker = values.get("trackerToken") ?? "";
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); response.end(localPaymentDoneHtml(/^[A-Za-z0-9_-]{16,}$/.test(tracker) ? tracker : null));
+    } catch { response.writeHead(404, { "content-type": "text/plain; charset=utf-8" }); response.end("Order not found"); }
+    return;
   }
   if (pathname === "/demo/pay" && request.method === "POST" && demoPayments) {
     try {

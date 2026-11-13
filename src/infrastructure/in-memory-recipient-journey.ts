@@ -2,15 +2,16 @@ import { randomUUID } from "node:crypto";
 import type { RecipientBox, RecipientJourneyRepository, RecipientProfile } from "../application/recipient-journey.js";
 import type { CheckoutDetails, PassItForwardRepository, PendingOrder, Referral } from "../application/pass-it-forward.js";
 import { createOpaqueToken, createReference, hashOpaqueToken } from "./secrets.js";
+import type { StartAGiftRepository } from "../application/start-a-gift.js";
 import type { GiverTrackerRepository, GiverTrackingRecord } from "../application/giver-tracker.js";
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
 import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
-export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, GiverTrackerRepository, MyStoriesRepository, SupportRepository {
+export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, GiverTrackerRepository, MyStoriesRepository, SupportRepository, StartAGiftRepository {
   private readonly boxes = new Map<string, RecipientBox>();
   private readonly sessions = new Map<string, { boxId: string }>();
   private readonly referrals = new Map<string, Referral>();
-  private readonly orders = new Map<string, { reference: string; parentBoxId: string; details: CheckoutDetails; paid: boolean; childCardToken?: string }>();
+  private readonly orders = new Map<string, { reference: string; parentBoxId: string | null; details: CheckoutDetails; paid: boolean; childCardToken?: string }>();
   private readonly trackers = new Map<string, GiverTrackingRecord>();
   private readonly recipientProfiles = new Map<string, RecipientProfile>();
   private readonly reminderPreferences = new Map<string, boolean>();
@@ -135,7 +136,21 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
     const trackerToken = createOpaqueToken();
     const reference = createReference("ORD");
     this.orders.set(referral.id, { reference, parentBoxId: referral.parentBoxId, details: structuredClone(details), paid: false });
-    this.trackers.set(hashOpaqueToken(trackerToken), { orderReference: reference, orderStatus: "pending_payment", paidAt: null, packedAt: null, collectedAt: null, deliveredAt: null });
+    this.trackers.set(hashOpaqueToken(trackerToken), { orderReference: reference, orderStatus: "pending_payment", startedTrail: false, orderedAt: new Date(), paidAt: null, packedAt: null, collectedAt: null, deliveredAt: null });
+    return { reference, paymentReference: reference, status: "pending_payment", trackerToken };
+  }
+  async createPendingStarterOrder(checkoutToken: string, details: CheckoutDetails): Promise<PendingOrder | null> {
+    const key = `starter:${hashOpaqueToken(checkoutToken)}`;
+    const existing = this.orders.get(key);
+    if (existing) {
+      if (existing.paid) return null;
+      existing.details = structuredClone(details);
+      return { reference: existing.reference, paymentReference: createReference("PAY"), status: "pending_payment", trackerToken: null };
+    }
+    const trackerToken = createOpaqueToken();
+    const reference = createReference("ORD");
+    this.orders.set(key, { reference, parentBoxId: null, details: structuredClone(details), paid: false });
+    this.trackers.set(hashOpaqueToken(trackerToken), { orderReference: reference, orderStatus: "pending_payment", startedTrail: true, orderedAt: new Date(), paidAt: null, packedAt: null, collectedAt: null, deliveredAt: null });
     return { reference, paymentReference: reference, status: "pending_payment", trackerToken };
   }
   async findByTrackerToken(token: string): Promise<GiverTrackingRecord | null> { return this.trackers.get(hashOpaqueToken(token)) ?? null; }
@@ -149,17 +164,19 @@ export class InMemoryRecipientJourneyRepository implements RecipientJourneyRepos
     const order = [...this.orders.values()].find((candidate) => candidate.reference === reference);
     if (!order) throw new Error("Order not found");
     if (order.childCardToken) return { cardToken: order.childCardToken };
-    const parent = [...this.boxes.values()].find((box) => box.id === order.parentBoxId);
-    if (!parent) throw new Error("Parent box not found");
-    const parentRecipient = this.recipientProfiles.get(parent.id) ?? { firstName: null, lastInitial: null, area: null, displayConsent: false };
     const cardToken = createOpaqueToken();
     const now = new Date();
-    this.boxes.set(cardToken, {
-      id: randomUUID(), boxNumber: `GS-${String(this.boxes.size + 1).padStart(5, "0")}`, trailId: parent.trailId, parentBoxId: parent.id,
-      depth: parent.depth + 1, cardToken, fulfilmentStatus: "delivered", recipientStatus: "unknown",
-      giver: null, giverName: order.details.giverName, giverNote: order.details.note,
-      members: [...parent.members, { position: parent.depth + 2, participant: parentRecipient }]
-    });
+    const boxNumber = `GS-${String(this.boxes.size + 1).padStart(5, "0")}`;
+    const story = { cardToken, fulfilmentStatus: "delivered" as const, recipientStatus: "unknown" as const, giver: null, giverName: order.details.giverName, giverNote: order.details.note };
+    if (order.parentBoxId === null) {
+      // A starter order begins a new trail with this box as its first.
+      this.boxes.set(cardToken, { id: randomUUID(), boxNumber, trailId: randomUUID(), parentBoxId: null, depth: 0, members: [], ...story });
+    } else {
+      const parent = [...this.boxes.values()].find((box) => box.id === order.parentBoxId);
+      if (!parent) throw new Error("Parent box not found");
+      const parentRecipient = this.recipientProfiles.get(parent.id) ?? { firstName: null, lastInitial: null, area: null, displayConsent: false };
+      this.boxes.set(cardToken, { id: randomUUID(), boxNumber, trailId: parent.trailId, parentBoxId: parent.id, depth: parent.depth + 1, members: [...parent.members, { position: parent.depth + 2, participant: parentRecipient }], ...story });
+    }
     order.paid = true; order.childCardToken = cardToken;
     for (const [hash, tracker] of this.trackers) if (tracker.orderReference === reference) this.trackers.set(hash, { ...tracker, orderStatus: "paid", paidAt: now, packedAt: now, collectedAt: now, deliveredAt: now });
     return { cardToken };

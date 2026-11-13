@@ -54,6 +54,12 @@ Raw QR tokens are never stored and are returned only when a card batch is issued
 
 After confirming receipt, a recipient may optionally choose their public label for future recipients. Explicit consent is required before any label is displayed, and that label is limited to first name, last initial, and area. The recipient can decline; no public label is then stored.
 
+## Start a gift box
+
+Anyone can start a new trail from the website: **Start a gift box** on the home page opens `/start`, the same form as passing a box on (their name and note for the recipient, delivery details, email). Resubmitting the form from the same browser reuses one pending order (a `starter_checkout` cookie identifies it; the token is stored only as a hash). The order is priced at `STARTER_AMOUNT_KOBO` (default: `PASS_ON_AMOUNT_KOBO`) and paid through the same Paystack flow and webhook. When payment is verified, a new trail and its first box are created as **Paid**, with the giver's name and note and the delivery label, ready for staff to pack. The buyer gets the same private tracker link as a pass-forward giver. Staff can still start trails by hand from the console for people who pay offline.
+
+Without Paystack, local testing against a database shows a **Simulate a successful payment** button instead (never in production); the in-memory demo simulates payment and delivery in one step.
+
 ## Staff console
 
 `/admin` is the browser interface for running fulfilment; it uses the same rules as the `/staff` API and needs PostgreSQL. Staff sign in by pasting their access token, which is kept in an `HttpOnly`, `SameSite=Strict` cookie scoped to `/admin` for 12 hours; every form submission must also come from the console's own origin.
@@ -101,7 +107,7 @@ Without `DATABASE_URL`, `npm run dev` serves the in-memory recipient demo (no st
 docker run -d --name gratitude-dev-db -e POSTGRES_USER=gratitude -e POSTGRES_PASSWORD=gratitude -e POSTGRES_DB=gratitude_stories \
   -p 55433:5432 -v gratitude-dev-db:/var/lib/postgresql/data postgres:16
 DATABASE_URL=postgres://gratitude:gratitude@localhost:55433/gratitude_stories npm run db:migrate
-npx tsx watch --env-file=.env.local src/server.ts
+npm run dev:local   # reads .env.local; plain `npm run dev` ignores it and runs the demo without a database
 ```
 
 For PostgreSQL environments, apply pending migrations before starting the service (safe to re-run; `db:status` lists applied and pending migrations):

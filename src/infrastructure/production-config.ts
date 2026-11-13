@@ -8,6 +8,10 @@ export function productionConfigProblems(env: NodeJS.ProcessEnv): string[] {
   if (!env.DATABASE_URL) problems.push("DATABASE_URL is required (the managed PostgreSQL connection string).");
   const amount = Number(env.PASS_ON_AMOUNT_KOBO);
   if (!Number.isInteger(amount) || amount <= 0) problems.push("PASS_ON_AMOUNT_KOBO must be a positive whole number of kobo (₦15,000 = 1500000).");
+  if (env.STARTER_AMOUNT_KOBO !== undefined && env.STARTER_AMOUNT_KOBO !== "") {
+    const starter = Number(env.STARTER_AMOUNT_KOBO);
+    if (!Number.isInteger(starter) || starter <= 0) problems.push("STARTER_AMOUNT_KOBO must be a positive whole number of kobo, or left unset to use PASS_ON_AMOUNT_KOBO.");
+  }
   const base = env.PUBLIC_BASE_URL;
   if (!base) problems.push("PUBLIC_BASE_URL is required: the https:// address printed on the cards, e.g. https://gratitude.ng");
   else {

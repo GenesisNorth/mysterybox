@@ -86,6 +86,7 @@ test("issuing cards returns a printable QR sheet once, encoding the card URL", (
   assert.equal(response.headers.get("cache-control"), "no-store");
   const page = await response.text();
   assert.match(page, /GS-CARD-ABC/); assert.match(page, /<svg/);
+  assert.match(page, /href="http:\/\/localhost:\d+\/b\/secret-card-token"[^>]*>Open this card \(local testing\)/, "outside production, each card has a clickable test link");
 }));
 
 test("in production, cards cannot be issued until PUBLIC_BASE_URL names the printed domain", () => withServer(async (base) => {
