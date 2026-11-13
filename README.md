@@ -139,6 +139,10 @@ Day-to-day operations are described for the fulfilment team in [docs/pilot-runbo
 
 Set `EMAIL_PROVIDER=resend` with `RESEND_API_KEY` and `EMAIL_FROM` (a sender on a domain verified in Resend) to send My Stories sign-in links and pass-forward reminder emails. `EMAIL_PROVIDER=log` prints emails, including their secret links, to the server log for local development and is refused in production. Leave it unset to keep reminders manual. The provider sits behind one small adapter (`src/infrastructure/email.ts`), so switching to another service means replacing one class. Emails never contain names or contact details of anyone on a trail.
 
+## Fonts
+
+Headings use **Bricolage Grotesque** and text uses **Nunito**, both self-hosted from `public/fonts` (the Content Security Policy allows only same-origin resources) and served at `/assets/fonts/*.woff2` with a one-year immutable cache. They are subset to Latin, Latin Extended (including Yoruba, Igbo and Hausa diacritics), punctuation, arrows and the naira sign, about 113 KB together. Both are licensed under the SIL Open Font License 1.1; the licence texts sit next to the files.
+
 ## Architecture
 
 - `src/domain` — pure business rules and state transitions.

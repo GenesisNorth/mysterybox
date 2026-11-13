@@ -44,3 +44,11 @@ test("the tracker renders a road map with the current stage marked, and invites 
 test("the confirmation pages after paying offer to gift another box", () => {
   for (const page of [localPaymentDoneHtml(null), paymentCompleteHtml(undefined)]) assert.match(page, /href="\/start"[^>]*>Gift another box/);
 });
+
+test("every page loads the self-hosted brand fonts", () => {
+  for (const page of [homeHtml(), checkoutHtml({ kind: "ready", start: true })]) {
+    assert.match(page, /@font-face\{font-family:"Nunito";src:url\(\/assets\/fonts\/nunito\.woff2\)/);
+    assert.match(page, /@font-face\{font-family:"Bricolage Grotesque";src:url\(\/assets\/fonts\/bricolage\.woff2\)/);
+    assert.match(page, /<link rel="preload" href="\/assets\/fonts\/bricolage\.woff2" as="font" type="font\/woff2" crossorigin>/);
+  }
+});

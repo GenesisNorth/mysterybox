@@ -11,6 +11,7 @@ import { MyStories, type MyStoriesRepository } from "./application/my-stories.js
 import { CheckoutValidationError, PassItForward, type PassItForwardRepository } from "./application/pass-it-forward.js";
 import { PaymentConfirmation } from "./application/payment-confirmation.js";
 import { StartAGift, type StartAGiftRepository } from "./application/start-a-gift.js";
+import { fontFiles } from "./web/fonts.js";
 import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
 import { cookieValue, formValue, formValues, rawBody } from "./web/http.js";
 import { handleAdmin, type StaffIdentity } from "./web/admin.js";
@@ -66,6 +67,7 @@ const secureCookie = process.env.NODE_ENV === "production" ? "; Secure" : "";
 const requestWindows = new Map<string, { count: number; resetAt: number }>();
 const requestMetrics = new Map<string, number>();
 const heroImage = projectPath("public", "gratitude-gift-hero.jpg");
+const fontCache = new Map<string, Buffer>();
 function isRateLimited(request: IncomingMessage, limit: number): boolean {
   const now = Date.now();
   if (requestWindows.size > 10_000) for (const [address, window] of requestWindows) if (window.resetAt <= now) requestWindows.delete(address);
@@ -118,7 +120,17 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   response.on("finish", () => { const route=logRoute(pathname); const metric=`${request.method ?? "UNKNOWN"} ${route} ${response.statusCode}`; requestMetrics.set(metric,(requestMetrics.get(metric) ?? 0)+1); console.info(JSON.stringify({ requestId, method: request.method, route, status: response.statusCode })); });
   if (request.method === "POST" && isRateLimited(request, 30)) { response.writeHead(429, { "retry-after": "60", "content-type": "text/plain; charset=utf-8" }); response.end("Too many requests"); return; }
   if (pathname === "/health") { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "ok" })); return; }
-  if (pathname === "/favicon.svg") { response.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }); response.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f8d27a"/><stop offset="1" stop-color="#7e5dcc"/></linearGradient></defs><rect width="64" height="64" rx="18" fill="url(#g)"/><path d="M32 14l4.3 13.7L50 32l-13.7 4.3L32 50l-4.3-13.7L14 32l13.7-4.3z" fill="#fff"/></svg>`); return; }
+  if (pathname === "/favicon.svg") { response.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }); response.end(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#0f7b4f"/><path d="M32 14l4.3 13.7L50 32l-13.7 4.3L32 50l-4.3-13.7L14 32l13.7-4.3z" fill="#fff"/></svg>`); return; }
+  const fontMatch = pathname.match(/^\/assets\/fonts\/([a-z]+\.woff2)$/);
+  if (fontMatch?.[1] && fontMatch[1] in fontFiles) {
+    try {
+      const name = fontMatch[1] as keyof typeof fontFiles;
+      const body = fontCache.get(name) ?? await readFile(projectPath("public", "fonts", fontFiles[name]));
+      fontCache.set(name, body);
+      response.writeHead(200, { "content-type": "font/woff2", "cache-control": "public, max-age=31536000, immutable" }); response.end(body);
+    } catch { response.writeHead(404); response.end(); }
+    return;
+  }
   if (pathname === "/assets/gratitude-gift-hero.jpg") { try { response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "public, max-age=604800, immutable" }); response.end(await readFile(heroImage)); } catch { response.writeHead(404); response.end(); } return; }
   if (pathname === "/" && request.method === "GET") { response.writeHead(200, { "content-type": "text/html; charset=utf-8" }); response.end(homeHtml(Boolean(demoRepository))); return; }
   if (pathname === "/metrics") {
