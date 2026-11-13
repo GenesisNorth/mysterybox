@@ -7,7 +7,7 @@
  * Confirm that policy, and retention periods, in the privacy/legal review for the launch jurisdiction.
  */
 export type ErasureSubject = "recipient" | "giver";
-export interface PurgeResult { holderSessions: number; storySessions: number; storyLinks: number; referrals: number; recoveryLinks: number; }
+export interface PurgeResult { holderSessions: number; storySessions: number; storyLinks: number; referrals: number; recoveryLinks: number; staffSessions?: number; staffPasswordLinks?: number; }
 
 export interface PrivacyRepository {
   /** Deletes expired secrets older than `graceDays`; referrals only when no order was ever created from them. */

@@ -5,7 +5,9 @@ import type { HelpDesk, HolderRecovery, PassForwardReminders } from "../applicat
 import type { DataRetention } from "../application/privacy.js";
 import type { AnalyticsRepository } from "../application/analytics.js";
 import { dashboardHtml } from "./admin-dashboard.js";
-import { boxDetailHtml, boxesHtml, cardsHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, staffHtml, staffTokenHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
+import { accountHtml, boxDetailHtml, boxesHtml, cardsHtml, choosePasswordHtml, forgotHtml, helpQueueHtml, loginHtml, printSheetHtml, recoveryLinkHtml, remindersPageHtml, setupHtml, staffHtml, staffPasswordLinkHtml, type BoxDetail, type ConsoleIdentity, type Flash } from "./admin-views.js";
+import { PasswordError, SignInError, type StaffAccounts } from "../application/staff-accounts.js";
+import type { EmailSender } from "../infrastructure/email.js";
 import { cookieValue, formValues, isSameOrigin } from "./http.js";
 import { setActor } from "../infrastructure/actor-context.js";
 
@@ -20,13 +22,16 @@ export interface AdminDependencies {
   analytics: AnalyticsRepository | null;
   /** An email provider is connected, so email reminders are sent automatically. */
   automaticEmail: boolean;
-  identify(token: string | undefined): Promise<StaffIdentity | null>;
+  /** Email and password sign-in, sessions and one-time password links. */
+  accounts: null | Pick<StaffAccounts, "signIn" | "identify" | "signOut" | "issuePasswordLink" | "passwordLink" | "completePasswordLink" | "changePassword" | "setupAvailable" | "setUpFirstAdministrator">;
+  /** Sends invite and reset links by email when a provider is configured; otherwise links are shown to the administrator. */
+  email: EmailSender | null;
   production: boolean;
   /** The public origin printed into QR codes, e.g. https://gratitude.ng. Required in production. */
   publicBaseUrl: string | undefined;
 }
 
-const cookieName = "staff_token";
+const cookieName = "staff_session";
 const sessionSeconds = 12 * 60 * 60;
 
 function html(response: ServerResponse, status: number, body: string): void {
@@ -52,28 +57,78 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
   // Cookie-authenticated forms: refuse any POST that did not come from one of our own pages.
   if (request.method === "POST" && !isSameOrigin(request)) { html(response, 403, loginHtml({ error: "This request did not come from the staff console. Please try again from the console." })); return true; }
   const staff = deps.staffOperations;
-  if (!staff) { html(response, 503, loginHtml({ error: "The staff console needs the PostgreSQL database (DATABASE_URL) to be configured." })); return true; }
+  if (!staff || !deps.accounts) { html(response, 503, loginHtml({ error: "The staff console needs the PostgreSQL database (DATABASE_URL) to be configured." })); return true; }
+
+  const sessionCookie = (token: string) => `${cookieName}=${token}; HttpOnly${secure}; SameSite=Strict; Path=/admin; Max-Age=${sessionSeconds}`;
+  const signedIn = (token: string) => redirect(response, "/admin", {}, { "set-cookie": sessionCookie(token) });
+  const base = () => (deps.publicBaseUrl ?? (deps.production ? undefined : `http://${request.headers.host}`))?.replace(/\/$/, "");
+  const accounts = deps.accounts;
 
   if (path === "/admin/login") {
-    if (request.method === "GET") { html(response, 200, loginHtml(flash)); return true; }
+    if (request.method === "GET") { html(response, 200, loginHtml(flash, { setup: await accounts.setupAvailable() })); return true; }
     if (request.method === "POST") {
-      const token = (await formValues(request)).get("token")?.trim();
-      if (!await deps.identify(token)) { html(response, 401, loginHtml({ error: "That token was not recognised, or it has been revoked." })); return true; }
-      redirect(response, "/admin", {}, { "set-cookie": `${cookieName}=${encodeURIComponent(token!)}; HttpOnly${secure}; SameSite=Strict; Path=/admin; Max-Age=${sessionSeconds}` });
+      const values = await formValues(request); const email = values.get("email") ?? "";
+      try { const { sessionToken } = await accounts.signIn(email, values.get("password") ?? ""); signedIn(sessionToken); }
+      catch (error) { html(response, 401, loginHtml({ error: error instanceof SignInError ? error.message : "Sign-in failed. Please try again." }, { setup: await accounts.setupAvailable(), email })); }
+      return true;
+    }
+  }
+  if (path === "/admin/setup") {
+    if (!await accounts.setupAvailable()) { redirect(response, "/admin/login", { notice: "Setup is complete. Sign in with your email and password." }); return true; }
+    if (request.method === "GET") { html(response, 200, setupHtml(flash)); return true; }
+    if (request.method === "POST") {
+      const values = await formValues(request); const get = (name: string) => values.get(name) ?? "";
+      try { const { sessionToken } = await accounts.setUpFirstAdministrator(get("code"), get("email"), get("password"), get("confirm")); signedIn(sessionToken); }
+      catch (error) { html(response, 422, setupHtml({ error: error instanceof PasswordError ? error.message : "Setup failed. Please try again." }, { email: get("email") })); }
+      return true;
+    }
+  }
+  if (path === "/admin/forgot") {
+    if (request.method === "GET") { html(response, 200, forgotHtml(flash, { emailEnabled: Boolean(deps.email) })); return true; }
+    if (request.method === "POST") {
+      const email = (await formValues(request)).get("email")?.trim().toLowerCase() ?? "";
+      const origin = base();
+      if (deps.email && origin && email) {
+        // The same answer whether or not the email has an account, so the page cannot be used to discover staff emails.
+        try {
+          const token = await accounts.issuePasswordLink(email, "reset", "self-service");
+          if (token) await deps.email.send({ to: email, subject: "Reset your Gratitude Stories staff password", text: `Someone asked to reset the password for this staff account.\n\nChoose a new password here (the link works once and expires in 24 hours):\n${origin}/admin/password/${token}\n\nIf it wasn't you, you can ignore this email. Your password has not changed.` });
+        } catch { console.error(JSON.stringify({ event: "staff.reset_email.error" })); }
+      }
+      html(response, 200, forgotHtml({}, { emailEnabled: Boolean(deps.email), sent: Boolean(deps.email) })); return true;
+    }
+  }
+  const passwordRoute = path.match(/^\/admin\/password\/([A-Za-z0-9_-]{20,})$/);
+  if (passwordRoute?.[1]) {
+    const token = passwordRoute[1];
+    if (request.method === "GET") { const link = await accounts.passwordLink(token); html(response, link ? 200 : 410, choosePasswordHtml(flash, token, link)); return true; }
+    if (request.method === "POST") {
+      const values = await formValues(request);
+      try { const { sessionToken } = await accounts.completePasswordLink(token, values.get("password") ?? "", values.get("confirm") ?? ""); signedIn(sessionToken); }
+      catch (error) { html(response, 422, choosePasswordHtml({ error: error instanceof PasswordError ? error.message : "That didn't work. Please try again." }, token, await accounts.passwordLink(token))); }
       return true;
     }
   }
   if (path === "/admin/logout" && request.method === "POST") {
+    await accounts.signOut(cookieValue(request, cookieName));
     redirect(response, "/admin/login", { notice: "Signed out." }, { "set-cookie": `${cookieName}=; HttpOnly${secure}; SameSite=Strict; Path=/admin; Max-Age=0` });
     return true;
   }
 
-  const raw = cookieValue(request, cookieName);
-  const identity = await deps.identify(raw ? decodeURIComponent(raw) : undefined);
-  if (!identity) { redirect(response, "/admin/login", raw ? { error: "Your session has ended. Please sign in again." } : {}); return true; }
+  const session = cookieValue(request, cookieName);
+  const identity = await accounts.identify(session);
+  if (!identity) { redirect(response, "/admin/login", session ? { error: "Your session has ended. Please sign in again." } : {}); return true; }
   setActor(identity.actor);
   const admin = identity.role === "admin";
   const requireAdmin = () => { if (!admin) throw new Error("Only an administrator can do that"); };
+
+  if (path === "/admin/account" && request.method === "GET") { html(response, 200, accountHtml(identity, flash)); return true; }
+  if (path === "/admin/account/password" && request.method === "POST") {
+    const values = await formValues(request);
+    try { await accounts.changePassword(session!, values.get("current") ?? "", values.get("password") ?? "", values.get("confirm") ?? ""); redirect(response, "/admin/account", { notice: "Password changed. Your other devices were signed out." }); }
+    catch (error) { redirect(response, "/admin/account", { error: error instanceof PasswordError ? error.message : "Your password could not be changed." }); }
+    return true;
+  }
 
   if ((path === "/admin" || path === "/admin/") && request.method === "GET") {
     html(response, 200, dashboardHtml(identity, deps.analytics ? await orNull(() => deps.analytics!.dashboardAnalytics()) : null, flash)); return true;
@@ -221,6 +276,25 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
     }
   }
 
+
+  /** Issues an invite or reset link, emails it when possible, and shows it once to the administrator. */
+  const passwordLinkPage = async (email: string, purpose: "invite" | "reset") => {
+    const origin = base();
+    if (!origin) throw new Error("Set PUBLIC_BASE_URL before creating password links");
+    const token = await accounts.issuePasswordLink(email, purpose, identity.actor);
+    if (!token) throw new Error("Active staff account not found");
+    const link = `${origin}/admin/password/${token}`;
+    let emailed = false;
+    if (deps.email) {
+      try {
+        await deps.email.send({ to: email, subject: purpose === "invite" ? "You're invited to the Gratitude Stories staff console" : "Reset your Gratitude Stories staff password", text: purpose === "invite"
+          ? `${identity.actor} invited you to the Gratitude Stories staff console.\n\nChoose your password here (the link works once and expires in 3 days):\n${link}`
+          : `${identity.actor} created a password reset link for your staff account.\n\nChoose a new password here (the link works once and expires in 24 hours):\n${link}` });
+        emailed = true;
+      } catch { console.error(JSON.stringify({ event: "staff.password_link_email.error" })); }
+    }
+    return staffPasswordLinkHtml(identity, email, link, purpose, emailed);
+  };
   // Staff accounts: administrators only. Nobody can revoke or demote their own account from here.
   if (path === "/admin/staff" || path.startsWith("/admin/staff/")) {
     if (!admin) { html(response, 403, boxesHtml(identity, [], "", { error: "Only an administrator can manage staff accounts." })); return true; }
@@ -230,17 +304,17 @@ export async function handleAdmin(request: IncomingMessage, response: ServerResp
         const values = await formValues(request); const role = values.get("role");
         if (role !== "admin" && role !== "operations") throw new Error("Choose a role");
         const created = await staff.provisionStaffUser(values.get("email") ?? "", role);
-        html(response, 201, staffTokenHtml(identity, created.email, created.apiToken, false));
+        html(response, 201, await passwordLinkPage(created.email, "invite"));
       } catch (error) { redirect(response, "/admin/staff", { error: /duplicate|unique/i.test(message(error)) ? "That email already has an account." : message(error) }); }
       return true;
     }
-    const staffRoute = path.match(/^\/admin\/staff\/([^/]+)\/(rotate|role|revoke)$/);
+    const staffRoute = path.match(/^\/admin\/staff\/([^/]+)\/(password-link|role|revoke)$/);
     if (staffRoute?.[1] && request.method === "POST") {
       const email = decodeURIComponent(staffRoute[1]).trim().toLowerCase(); const step = staffRoute[2];
       try {
         if (email === identity.actor) throw new Error("You cannot change your own account here; ask another administrator.");
         const values = await formValues(request);
-        if (step === "rotate") { const rotated = await staff.rotateStaffUserToken(email); html(response, 200, staffTokenHtml(identity, rotated.email, rotated.apiToken, true)); return true; }
+        if (step === "password-link") { const users = await staff.staffUsers(); const user = users.find((candidate) => candidate.email === email && candidate.active); if (!user) throw new Error("Active staff account not found"); html(response, 200, await passwordLinkPage(email, user.passwordSet ? "reset" : "invite")); return true; }
         if (step === "role") { const role = values.get("role"); if (role !== "admin" && role !== "operations") throw new Error("Choose a role"); await staff.changeStaffRole(email, role); redirect(response, "/admin/staff", { notice: `${email} is now ${role === "admin" ? "an administrator" : "operations staff"}.` }); return true; }
         if (values.get("confirm") !== "yes") throw new Error("Tick the box to confirm revoking access");
         await staff.revokeStaffUser(email); redirect(response, "/admin/staff", { notice: `Access revoked for ${email}.` });

@@ -21,7 +21,7 @@ The server refuses to start in production until the required settings are presen
 | `PUBLIC_BASE_URL` | yes | `https://` origin printed on cards, no path. Used in QR codes, reminder and recovery links |
 | `PASS_ON_AMOUNT_KOBO` | yes | Price of a passed-forward box in kobo (₦15,000 = `1500000`) |
 | `STARTER_AMOUNT_KOBO` | no | Price of a box bought from **Start a gift box** (a new trail). Defaults to `PASS_ON_AMOUNT_KOBO` |
-| `STAFF_ADMIN_TOKEN` | yes, at first | 32+ random characters. Lets you sign in once to create named staff accounts; remove it afterwards |
+| `STAFF_ADMIN_TOKEN` | yes, at first | 32+ random characters. The one-time **setup code** for creating the first administrator at `/admin/setup`; remove it afterwards |
 | `TRUST_PROXY` | behind a proxy | `true` on Render, Railway, Fly and most hosts, so rate limiting sees real visitors |
 | `SUPPORT_WHATSAPP_NUMBER` | optional | Digits only, e.g. `2348030000000`. Shows a WhatsApp button on the help page |
 | `EMAIL_PROVIDER`, `RESEND_API_KEY`, `EMAIL_FROM` | optional | `resend` plus key and a sender on your verified domain. Unset = reminders stay manual |
@@ -37,7 +37,7 @@ Generate random tokens with `openssl rand -base64 33`. Never commit them; set th
 3. Check the plans and prices on the preview screen, then fill in the values it asks for: `PUBLIC_BASE_URL`, `PASS_ON_AMOUNT_KOBO`, and optionally WhatsApp and email.
 4. Apply. Each deploy builds the app, **runs database migrations**, then starts the new version once `/ready` answers.
 5. **Custom domain:** in the web service's Settings, add your domain and create the DNS record Render shows. HTTPS certificates are automatic.
-6. Your bootstrap admin token is under the web service's **Environment** tab (`STAFF_ADMIN_TOKEN`).
+6. Your setup code is under the web service's **Environment** tab (`STAFF_ADMIN_TOKEN`).
 
 ## Option B: any Docker host (Railway, Fly.io, a VPS, …)
 
@@ -54,10 +54,10 @@ Without Docker, the same steps are: `npm ci --include=dev && npm run build && np
 
 ## First sign-in
 
-1. Open `https://<your domain>/admin` and paste the `STAFF_ADMIN_TOKEN`.
-2. Go to **Staff** and create an administrator account for yourself. Copy the token it shows (it is shown once) into your password manager.
-3. Sign out, sign in with your own token, and create accounts for the rest of the team (operations for fulfilment staff).
-4. Remove `STAFF_ADMIN_TOKEN` from the host's settings and redeploy. From now on the history shows each person by name.
+1. Open `https://<your domain>/admin/setup`. Enter the setup code (`STAFF_ADMIN_TOKEN`), your email and a password. You are signed in as the first administrator, and the setup page closes for good.
+2. Go to **Staff** and invite the rest of the team (operations for fulfilment staff). Each invite gives you a one-time link to send them privately; they choose their own password.
+3. Check you can sign out and back in with your email and password.
+4. Remove `STAFF_ADMIN_TOKEN` from the host's settings and redeploy. From now on everyone signs in with their own email and password, and the history shows each person by name.
 
 ## Every deploy
 

@@ -25,6 +25,7 @@ export function productionConfigProblems(env: NodeJS.ProcessEnv): string[] {
     const value = env[name];
     if (value && value.length < 32) problems.push(`${name} must be at least 32 random characters (or left unset).`);
   }
-  if (!env.STAFF_ADMIN_TOKEN && !env.STAFF_ACCESS_TOKEN) problems.push("STAFF_ADMIN_TOKEN is required to bootstrap the first administrator (you can remove it once named staff accounts exist).");
+  // STAFF_ADMIN_TOKEN is optional: it is only the one-time setup code for the first administrator (/admin/setup),
+  // and is meant to be removed once that account exists. Without it the setup page stays closed.
   return problems;
 }

@@ -12,6 +12,7 @@ import { CheckoutValidationError, PassItForward, type PassItForwardRepository } 
 import { PaymentConfirmation } from "./application/payment-confirmation.js";
 import { StartAGift, type StartAGiftRepository } from "./application/start-a-gift.js";
 import { fontFiles } from "./web/fonts.js";
+import { StaffAccounts } from "./application/staff-accounts.js";
 import { GiverTracker, type GiverTrackerRepository } from "./application/giver-tracker.js";
 import { cookieValue, formValue, formValues, rawBody } from "./web/http.js";
 import { handleAdmin, type StaffIdentity } from "./web/admin.js";
@@ -47,6 +48,8 @@ const myStories = new MyStories(repository);
 const helpDesk = new HelpDesk(repository);
 const passForwardReminders = new PassForwardReminders(repository);
 const holderRecovery = new HolderRecovery(repository);
+/** Staff sign in with email and password. STAFF_ADMIN_TOKEN is the one-time setup code for the first administrator. */
+const staffAccounts = postgresRepository ? new StaffAccounts(postgresRepository, process.env.STAFF_ADMIN_TOKEN ?? process.env.STAFF_ACCESS_TOKEN) : null;
 const dataRetention = postgresRepository ? new DataRetention(postgresRepository) : null;
 /** Optional WhatsApp support number in international format without "+", e.g. 2348030000000. */
 const supportWhatsapp = process.env.SUPPORT_WHATSAPP_NUMBER?.replace(/\D/g, "") || null;
@@ -143,7 +146,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     catch { response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ status: "not-ready" })); }
     return;
   }
-  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, retention: dataRetention, analytics: postgresRepository ?? null, automaticEmail: Boolean(emailSender), identify: staffIdentityForToken, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
+  if (await handleAdmin(request, response, { staffOperations, helpDesk, reminders: passForwardReminders, recovery: holderRecovery, retention: dataRetention, analytics: postgresRepository ?? null, automaticEmail: Boolean(emailSender), accounts: staffAccounts, email: emailSender, production: process.env.NODE_ENV === "production", publicBaseUrl: process.env.PUBLIC_BASE_URL })) return;
   if (pathname.startsWith("/staff/")) {
     if (!staffOperations) { json(response, 503, { error: "Staff operations require PostgreSQL" }); return; }
     const identity = await staffIdentity(request);

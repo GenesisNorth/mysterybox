@@ -62,7 +62,9 @@ Without Paystack, local testing against a database shows a **Simulate a successf
 
 ## Staff console
 
-`/admin` is the browser interface for running fulfilment; it uses the same rules as the `/staff` API and needs PostgreSQL. Staff sign in by pasting their access token, which is kept in an `HttpOnly`, `SameSite=Strict` cookie scoped to `/admin` for 12 hours; every form submission must also come from the console's own origin.
+`/admin` is the browser interface for running fulfilment; it uses the same rules as the `/staff` API and needs PostgreSQL. Staff sign in with their **email and password**. Passwords are stored only as scrypt hashes and must be at least 10 characters; five wrong attempts lock an account for 15 minutes. Signing in starts a 12-hour server-side session (the `staff_session` cookie is `HttpOnly`, `SameSite=Strict` and scoped to `/admin`; only a hash of its value is stored), which ends on sign-out, on a password change or reset (other devices), and when the account is revoked. Every form submission must also come from the console's own origin.
+
+**Getting in the first time:** open `/admin/setup` and enter the setup code (the `STAFF_ADMIN_TOKEN` value), your email and a password. That creates the first administrator and the page closes for good. Administrators then invite people from **Staff**: each invite is a one-time link (72 hours) for the person to choose their own password, shown once to the administrator and also emailed when an email provider is configured. **Password reset links** (24 hours) work the same way; with email configured, **Forgot your password?** sends one without revealing whether the address has an account. Everyone can change their own password under **Your account**. The bearer-token `/staff` JSON API is unchanged.
 
 Pages are reached from a sidebar (on phones it becomes a scrolling strip at the top); a box or trail search sits in the top bar of every page.
 

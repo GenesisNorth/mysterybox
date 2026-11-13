@@ -7,17 +7,30 @@ import { handleAdmin, type StaffIdentity } from "./admin.js";
 import { HelpDesk, HolderRecovery, PassForwardReminders } from "../application/support.js";
 import { emptyPipeline, type AnalyticsRepository, type DashboardAnalytics } from "../application/analytics.js";
 import { InMemoryRecipientJourneyRepository, demoRecipientBoxes } from "../infrastructure/in-memory-recipient-journey.js";
+import { StaffAccounts } from "../application/staff-accounts.js";
+import { InMemoryStaffAccounts } from "../infrastructure/in-memory-staff-accounts.js";
+import { hashPassword } from "../infrastructure/passwords.js";
+import { hashOpaqueToken } from "../infrastructure/secrets.js";
 
 const support = new InMemoryRecipientJourneyRepository(demoRecipientBoxes);
 const helpDesk = new HelpDesk(support);
 const reminders = new PassForwardReminders(support);
 
-const tokens: Record<string, StaffIdentity> = { "admin-token": { actor: "admin@example.com", role: "admin" }, "ops-token": { actor: "ops@example.com", role: "operations" } };
+// Staff accounts: real sign-in rules over an in-memory store. "admin-token" and "ops-token" are seeded signed-in sessions.
+const goodPassword = "correct horse battery";
+const accountStore = new InMemoryStaffAccounts();
+const adminId = accountStore.addUser("admin@example.com", "admin", await hashPassword(goodPassword));
+const opsId = accountStore.addUser("ops@example.com", "operations", await hashPassword(goodPassword));
+accountStore.addSession(adminId, hashOpaqueToken("admin-token")); accountStore.addSession(opsId, hashOpaqueToken("ops-token"));
+const accounts = new StaffAccounts(accountStore, "setup-code-for-tests");
+void (null as unknown as StaffIdentity);
 const calls: string[] = [];
 const staff = {
   recentBoxes: async () => [], searchBoxes: async () => [], inventory: async () => [],
   issueCards: async (quantity: number) => { calls.push(`issue:${quantity}`); return [{ cardCode: "GS-CARD-ABC", cardToken: "secret-card-token" }]; },
   createStarterBox: async () => { calls.push("starter"); return { boxNumber: "GS-00009", trailCode: "TRAIL-X" }; },
+  provisionStaffUser: async (email: string, role: "admin" | "operations") => { accountStore.addUser(email, role); return { email, role, apiToken: "unused" }; },
+  staffUsers: async () => [...accountStore.users.values()].map((user) => ({ email: user.email, role: user.role, active: user.active, createdAt: new Date(), revokedAt: null, passwordSet: Boolean(user.passwordHash), lastLoginAt: null })),
   recordPacking: async () => { calls.push("pack"); throw new Error("Packing checklist must be complete"); }
 } as unknown as StaffOperations;
 const sampleAnalytics: DashboardAnalytics = {
@@ -33,9 +46,9 @@ const sampleAnalytics: DashboardAnalytics = {
 let analyticsFails = false;
 const analytics: AnalyticsRepository = { dashboardAnalytics: async () => { if (analyticsFails) throw new Error("database down"); return sampleAnalytics; } };
 
-async function withServer(run: (base: string) => Promise<void>, production = false): Promise<void> {
+async function withServer(run: (base: string) => Promise<void>, production = false, staffAccounts: StaffAccounts = accounts): Promise<void> {
   const server: Server = createServer(async (request, response) => {
-    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), retention: null, analytics, automaticEmail: false, identify: async (token) => (token && tokens[token]) || null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
+    if (!await handleAdmin(request, response, { staffOperations: staff, helpDesk, reminders, recovery: new HolderRecovery(support), retention: null, analytics, automaticEmail: false, accounts: staffAccounts, email: null, production, publicBaseUrl: production ? undefined : undefined })) { response.writeHead(404); response.end(); }
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -44,7 +57,8 @@ async function withServer(run: (base: string) => Promise<void>, production = fal
 const post = (base: string, path: string, body: Record<string, string>, headers: Record<string, string> = {}) =>
   fetch(base + path, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", origin: base, ...headers }, body: new URLSearchParams(body) });
 const flashOf = (response: Response) => { const url = new URL(response.headers.get("location") ?? "", "http://x"); return { path: url.pathname, notice: url.searchParams.get("notice"), error: url.searchParams.get("error") }; };
-const as = (token: string) => ({ cookie: `staff_token=${token}` });
+const as = (token: string) => ({ cookie: `staff_session=${token}` });
+const sessionFrom = (response: Response) => /staff_session=([^;]+)/.exec(response.headers.get("set-cookie") ?? "")?.[1];
 
 test("console pages require sign-in and non-admin paths are left alone", () => withServer(async (base) => {
   const response = await fetch(`${base}/admin/boxes`, { redirect: "manual" });
@@ -52,13 +66,20 @@ test("console pages require sign-in and non-admin paths are left alone", () => w
   assert.equal((await fetch(`${base}/b/anything`)).status, 404);
 }));
 
-test("signing in sets a strict, http-only, admin-scoped cookie; a wrong token is refused", () => withServer(async (base) => {
-  assert.equal((await post(base, "/admin/login", { token: "nope" })).status, 401);
-  const response = await post(base, "/admin/login", { token: "admin-token" });
-  assert.equal(response.status, 303);
+test("signing in with email and password sets a strict, http-only, admin-scoped session cookie; a wrong password is refused", () => withServer(async (base) => {
+  const login = await (await fetch(`${base}/admin/login`)).text();
+  assert.match(login, /type="email"/); assert.match(login, /type="password"/); assert.doesNotMatch(login, /Access token/);
+  const wrong = await post(base, "/admin/login", { email: "admin@example.com", password: "not the password" });
+  assert.equal(wrong.status, 401); assert.match(await wrong.text(), /email and password don(&#39;|')t match/);
+  const response = await post(base, "/admin/login", { email: " Admin@Example.com ", password: goodPassword });
+  assert.equal(response.status, 303); assert.equal(response.headers.get("location"), "/admin");
   const cookie = response.headers.get("set-cookie") ?? "";
-  for (const part of ["staff_token=admin-token", "HttpOnly", "SameSite=Strict", "Path=/admin"]) assert.ok(cookie.includes(part), part);
+  for (const part of ["staff_session=", "HttpOnly", "SameSite=Strict", "Path=/admin"]) assert.ok(cookie.includes(part), part);
   assert.ok(!cookie.includes("Secure"), "Secure only in production");
+  const token = sessionFrom(response)!;
+  assert.equal((await fetch(`${base}/admin`, { headers: as(token), redirect: "manual" })).status, 200);
+  await post(base, "/admin/logout", {}, as(token));
+  assert.equal((await fetch(`${base}/admin`, { headers: as(token), redirect: "manual" })).status, 303, "signing out ends the session on the server");
 }));
 
 test("a POST from another site is refused even with a valid session cookie", () => withServer(async (base) => {
@@ -152,7 +173,7 @@ test("only administrators can erase personal details, and only with confirmation
 }));
 
 test("signing in lands on the overview: sidebar navigation, attention cards, charts and activity", () => withServer(async (base) => {
-  assert.equal((await post(base, "/admin/login", { token: "admin-token" })).headers.get("location"), "/admin");
+  assert.equal((await post(base, "/admin/login", { email: "admin@example.com", password: goodPassword })).headers.get("location"), "/admin");
   const page = await (await fetch(`${base}/admin`, { headers: as("admin-token") })).text();
   assert.match(page, /<aside class="side">/); assert.match(page, /<a href="\/admin" aria-current="page">/);
   for (const text of ["Paid boxes waiting over a day", "Open help requests", "Reminders due to send", "Printed cards in stock", "Pass-forward rate", "63%", "₦45,000", "2.5 days", "New boxes per week", "Where every box is", "Recipient journey", "How far trails reach", "Recorded packing", "Show as table"]) assert.ok(page.includes(text), text);
@@ -167,3 +188,52 @@ test("operations staff see the overview without reminders or staff links; a fail
   try { const failed = await fetch(`${base}/admin`, { headers: as("admin-token") }); assert.equal(failed.status, 200); assert.match(await failed.text(), /could not be loaded/); }
   finally { analyticsFails = false; }
 }));
+
+test("five wrong passwords lock the account for 15 minutes, even with the right password", () => withServer(async (base) => {
+  const store = new InMemoryStaffAccounts(); store.addUser("lock@example.com", "operations", await hashPassword(goodPassword));
+  await withServer(async (inner) => {
+    for (let i = 0; i < 5; i++) await post(inner, "/admin/login", { email: "lock@example.com", password: "wrong password!" });
+    const locked = await post(inner, "/admin/login", { email: "lock@example.com", password: goodPassword });
+    assert.equal(locked.status, 401); assert.match(await locked.text(), /Too many attempts/);
+  }, false, new StaffAccounts(store, undefined));
+  void base;
+}));
+
+test("an administrator invites a person; the one-time link lets them choose a password and signs them in", () => withServer(async (base) => {
+  const page = await (await post(base, "/admin/staff", { email: "new.person@example.com", role: "operations" }, as("admin-token"))).text();
+  const link = /\/admin\/password\/([A-Za-z0-9_-]+)/.exec(page)?.[1];
+  assert.ok(link, "the invite link is shown once"); assert.match(page, /Send this link to them privately/);
+  assert.match(await (await fetch(`${base}/admin/password/${link}`)).text(), /Welcome aboard/);
+  assert.match(await (await post(base, `/admin/password/${link}`, { password: "a long phrase here", confirm: "a different phrase" })).text(), /don(&#39;|')t match/);
+  assert.match(await (await post(base, `/admin/password/${link}`, { password: "short", confirm: "short" })).text(), /at least 10 characters/);
+  const done = await post(base, `/admin/password/${link}`, { password: "green boxes travel far", confirm: "green boxes travel far" });
+  assert.equal(done.status, 303); assert.ok(sessionFrom(done));
+  assert.equal((await fetch(`${base}/admin/password/${link}`)).status, 410, "the link works once");
+  assert.equal((await post(base, "/admin/login", { email: "new.person@example.com", password: "green boxes travel far" })).status, 303);
+  assert.equal((await post(base, "/admin/staff", { email: "x@example.com", role: "operations" }, as("ops-token"))).status, 403, "only administrators invite");
+}));
+
+test("the first administrator is created once, with the setup code; then setup closes", async () => {
+  const store = new InMemoryStaffAccounts();
+  await withServer(async (base) => {
+    assert.match(await (await fetch(`${base}/admin/login`)).text(), /Set up the first administrator/);
+    assert.match(await (await post(base, "/admin/setup", { code: "wrong", email: "owner@example.com", password: "my gift shop rocks", confirm: "my gift shop rocks" })).text(), /setup code is not right/);
+    const ok = await post(base, "/admin/setup", { code: "the-setup-code", email: "Owner@Example.com", password: "my gift shop rocks", confirm: "my gift shop rocks" });
+    assert.equal(ok.status, 303); assert.ok(sessionFrom(ok));
+    assert.equal((await fetch(`${base}/admin/setup`, { redirect: "manual" })).status, 303, "setup is closed once an administrator has a password");
+    assert.doesNotMatch(await (await fetch(`${base}/admin/login`)).text(), /Set up the first administrator/);
+  }, false, new StaffAccounts(store, "the-setup-code"));
+});
+
+test("changing your password needs the current one and signs out your other devices; forgot-password without email asks an administrator", async () => {
+  const store = new InMemoryStaffAccounts(); const id = store.addUser("me@example.com", "admin", await hashPassword(goodPassword));
+  store.addSession(id, hashOpaqueToken("other-device"));
+  await withServer(async (base) => {
+    const token = sessionFrom(await post(base, "/admin/login", { email: "me@example.com", password: goodPassword }))!;
+    assert.match(flashOf(await post(base, "/admin/account/password", { current: "wrong one!!", password: "brand new phrase", confirm: "brand new phrase" }, as(token))).error ?? "", /current password/);
+    assert.match(flashOf(await post(base, "/admin/account/password", { current: goodPassword, password: "brand new phrase", confirm: "brand new phrase" }, as(token))).notice ?? "", /Password changed/);
+    assert.equal((await fetch(`${base}/admin`, { headers: as(token), redirect: "manual" })).status, 200, "this device stays signed in");
+    assert.equal((await fetch(`${base}/admin`, { headers: as("other-device"), redirect: "manual" })).status, 303, "other devices are signed out");
+    assert.match(await (await fetch(`${base}/admin/forgot`)).text(), /Ask an administrator/);
+  }, false, new StaffAccounts(store, undefined));
+});

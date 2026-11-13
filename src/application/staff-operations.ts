@@ -61,7 +61,7 @@ export interface DeliveryRecord { deliveredBy: string; proofReference: string; r
 export interface AuditEvent { actor: string; action: string; targetType: string; targetId: string; metadata: Record<string, unknown>; occurredAt: Date; }
 export type StaffRole = "admin" | "operations";
 export interface ProvisionedStaffUser { email: string; role: StaffRole; apiToken: string; }
-export interface StaffUserSummary { email: string; role: StaffRole; active: boolean; createdAt: Date; revokedAt: Date | null; }
+export interface StaffUserSummary { email: string; role: StaffRole; active: boolean; createdAt: Date; revokedAt: Date | null; passwordSet?: boolean; lastLoginAt?: Date | null; }
 export type ReminderKind = "receipt_confirmation" | "pass_forward";
 export interface ReminderJob { kind: ReminderKind; status: "queued" | "processing" | "sent" | "failed" | "cancelled"; scheduledAt: Date; sentAt: Date | null; }
 

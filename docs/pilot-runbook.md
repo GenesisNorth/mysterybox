@@ -1,6 +1,6 @@
 # Pilot runbook: running Gratitude Stories day to day
 
-For the person who packs, ships and supports boxes during the pilot. Everything happens in the staff console at **`https://<your domain>/admin`**. Sign in with your personal access token (keep it in your password manager; never share it).
+For the person who packs, ships and supports boxes during the pilot. Everything happens in the staff console at **`https://<your domain>/admin`**. Sign in with your work email and your own password (keep it in your password manager; never share it). Forgot it? Ask an administrator for a reset link, or use **Forgot your password?** once email is set up.
 
 ## Every morning (15 minutes)
 
@@ -61,7 +61,7 @@ Administrators only, once the box is delivered, cancelled or refunded: open the 
 
 ## Staff accounts
 
-Administrators: **Staff** tab. Create a personal account for each team member (Operations for fulfilment, Administrator only for people who need contact details). The token is shown once; hand it over privately. When someone leaves, **Revoke** their access the same day. If a token may have leaked, issue a **New token**.
+Administrators: **Staff** tab. Invite each team member with their work email (Operations for fulfilment, Administrator only for people who need contact details). You get a one-time invite link (also emailed to them once email is set up); send it privately, e.g. on WhatsApp. It expires in 3 days, and opening it lets them choose their own password. If someone forgets their password or gets locked out (5 wrong tries locks an account for 15 minutes), use **Password reset link** on their row. When someone leaves, **Revoke** their access the same day: it signs them out everywhere. Change your own password from **Your account** (click your name at the bottom of the sidebar).
 
 ## Never
 

@@ -17,9 +17,6 @@ const pill = (status: FulfilmentStatus) => `<span class="pill ${status}">${e(sta
 const boxHref = (boxNumber: string) => `/admin/boxes/${encodeURIComponent(boxNumber)}`;
 
 
-export function loginHtml(flash: Flash): string {
-  return consoleLayout("Sign in", null, flash, `<h1>Sign in</h1><p class="sub">Paste the staff access token you were given. It is stored only as a secure cookie on this browser for 12 hours.</p><form method="post" action="/admin/login"><label for="token">Access token</label><input id="token" name="token" type="password" required autocomplete="current-password"><button>Sign in</button></form>`);
-}
 
 export function boxesHtml(identity: ConsoleIdentity, boxes: StaffBoxOverview[], query: string, flash: Flash): string {
   const rows = boxes.map((box) => `<tr><td><a href="${boxHref(box.boxNumber)}">${e(box.boxNumber)}</a></td><td class="mono">${e(box.trailCode)}</td><td>${box.depth === 0 ? "Starter" : `Gen ${box.depth + 1}`}${box.parentBoxNumber ? ` <span class="muted">from ${e(box.parentBoxNumber)}</span>` : ""}</td><td>${pill(box.fulfilmentStatus)}</td><td>${e(recipientLabels[box.recipientStatus])}</td><td class="mono">${e(box.cardCode ?? "—")}</td><td>${e(when(box.createdAt))}</td></tr>`).join("");
@@ -143,20 +140,46 @@ const staffHref = (email: string) => `/admin/staff/${encodeURIComponent(email)}`
 export function staffHtml(identity: ConsoleIdentity, users: StaffUserSummary[], flash: Flash): string {
   const rows = users.map((user) => {
     const self = user.email === identity.actor;
-    const actions = !user.active ? `<span class="muted">Revoked ${e(when(user.revokedAt))}</span>` : self ? `<span class="muted">This is you</span>` : `
+    const status = !user.active ? "Revoked" : user.passwordSet ? `Active${user.lastLoginAt ? ` · last signed in ${e(when(user.lastLoginAt))}` : ""}` : `<span class="pill paid">Invite pending</span>`;
+    const actions = !user.active ? `<span class="muted">Revoked ${e(when(user.revokedAt))}</span>` : self ? `<a href="/admin/account">Your account</a>` : `
 <form method="post" action="${staffHref(user.email)}/role" class="inline" style="margin-bottom:8px"><select name="role" aria-label="Role for ${e(user.email)}"><option value="operations"${user.role === "operations" ? " selected" : ""}>Operations</option><option value="admin"${user.role === "admin" ? " selected" : ""}>Administrator</option></select><button class="secondary" style="margin:0">Change role</button></form>
-<form method="post" action="${staffHref(user.email)}/rotate" style="display:inline"><button class="secondary" style="margin:0">New token</button></form>
-<details style="display:inline-block;margin-left:10px"><summary>Revoke</summary><form method="post" action="${staffHref(user.email)}/revoke"><label class="check"><input type="checkbox" name="confirm" value="yes" required> Revoke access now</label><button class="danger">Revoke</button></form></details>`;
-    return `<tr><td>${e(user.email)}</td><td>${user.role === "admin" ? "Administrator" : "Operations"}</td><td>${user.active ? "Active" : "Revoked"}</td><td>${e(when(user.createdAt))}</td><td>${actions}</td></tr>`;
+<form method="post" action="${staffHref(user.email)}/password-link" style="display:inline"><button class="secondary" style="margin:0">${user.passwordSet ? "Password reset link" : "New invite link"}</button></form>
+<details style="display:inline-block;margin-left:10px"><summary>Revoke</summary><form method="post" action="${staffHref(user.email)}/revoke"><label class="check"><input type="checkbox" name="confirm" value="yes" required> Revoke access now and sign them out</label><button class="danger">Revoke</button></form></details>`;
+    return `<tr><td>${e(user.email)}</td><td>${user.role === "admin" ? "Administrator" : "Operations"}</td><td>${status}</td><td>${e(when(user.createdAt))}</td><td>${actions}</td></tr>`;
   }).join("");
-  const bootstrap = identity.actor === "staff-admin" || identity.actor === "staff-legacy"
-    ? `<p class="flash ok">You are signed in with the bootstrap token. Create a named administrator account for yourself, sign in with it, then remove STAFF_ADMIN_TOKEN from the server settings.</p>` : "";
-  return consoleLayout("Staff", identity, flash, `<h1>Staff accounts</h1><p class="sub">Each person gets their own token, so the history shows who did what. Operations staff run fulfilment and help; administrators also see contact details, start trails, issue cards and manage staff.</p>${bootstrap}
-<div class="panel"><h2>Add a person</h2><form method="post" action="/admin/staff" class="inline"><div style="flex:1"><label for="email">Work email</label><input id="email" name="email" type="email" required maxlength="254" style="max-width:none"></div><div><label for="role">Role</label><select id="role" name="role"><option value="operations">Operations</option><option value="admin">Administrator</option></select></div><button>Create account</button></form></div>
-<div class="panel">${users.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Added</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="empty">No named staff accounts yet.</p>`}</div>`);
+  return consoleLayout("Staff", identity, flash, `<h1>Staff accounts</h1><p class="sub">Everyone signs in with their own email and password, so the history shows who did what. Operations staff run fulfilment and help; administrators also see contact details, start trails, issue cards and manage staff.</p>
+<div class="panel"><h2>Invite a person</h2><p class="muted">They get a one-time link to choose their own password. You never see or set it.</p><form method="post" action="/admin/staff" class="inline"><div style="flex:1"><label for="email">Work email</label><input id="email" name="email" type="email" required maxlength="254" style="max-width:none"></div><div><label for="role">Role</label><select id="role" name="role"><option value="operations">Operations</option><option value="admin">Administrator</option></select></div><button>Create invite</button></form></div>
+<div class="panel">${users.length ? `<table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Added</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : `<p class="empty">No staff accounts yet.</p>`}</div>`);
 }
 
-/** Shown once: tokens are stored only as hashes. */
-export function staffTokenHtml(identity: ConsoleIdentity, email: string, token: string, rotated: boolean): string {
-  return consoleLayout("Staff token", identity, { notice: rotated ? `New token issued for ${email}. Their old token stopped working.` : `Account created for ${email}.` }, `<p class="muted"><a href="/admin/staff">← Staff accounts</a></p><h1>Token for ${e(email)}</h1><div class="panel next"><label>Give this to them privately (e.g. in person or through a password manager). It will not be shown again.</label><input readonly value="${e(token)}" class="mono" aria-label="Access token"><p class="muted">They sign in at /admin/login by pasting it. If it is lost, issue a new one.</p></div>`);
+/** Shown once: the link is stored only as a hash. */
+export function staffPasswordLinkHtml(identity: ConsoleIdentity, email: string, link: string, purpose: "invite" | "reset", emailed: boolean): string {
+  const invite = purpose === "invite";
+  return consoleLayout("Staff", identity, { notice: invite ? `Invite created for ${email}.` : `Password reset link created for ${email}.` }, `<p class="muted"><a href="/admin/staff">← Staff accounts</a></p><h1>${invite ? "Invite" : "Reset link"} for ${e(email)}</h1><div class="panel next">${emailed ? `<p>We emailed this link to <b>${e(email)}</b>. You can also send it yourself:</p>` : `<p>Send this link to them privately, for example on WhatsApp. It is shown only once.</p>`}<input readonly value="${e(link)}" class="mono" aria-label="${invite ? "Invite" : "Reset"} link"><p class="muted">It works once and expires in ${invite ? "3 days" : "24 hours"}. Opening it lets them choose ${invite ? "their" : "a new"} password and signs them in.${invite ? "" : " Their other devices are signed out."}</p></div>`);
+}
+
+const passwordRules = `<p class="hint">At least 10 characters. A short phrase of a few words is easy to remember and hard to guess.</p>`;
+
+export function loginHtml(flash: Flash, options: { setup?: boolean; email?: string } = {}): string {
+  return consoleLayout("Sign in", null, flash, `<h1>Sign in</h1><p class="sub">Welcome back. Use your work email and password.</p><form method="post" action="/admin/login"><label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="username" value="${e(options.email)}" autofocus><label for="password">Password</label><input id="password" name="password" type="password" required autocomplete="current-password"><button class="wide">Sign in</button></form><p class="aside"><a href="/admin/forgot">Forgot your password?</a></p>${options.setup ? `<p class="aside setup">First time here? <a href="/admin/setup">Set up the first administrator</a></p>` : ""}`);
+}
+
+export function setupHtml(flash: Flash, values: { email?: string } = {}): string {
+  return consoleLayout("Set up", null, flash, `<h1>Set up your console</h1><p class="sub">Create the first administrator account. You need the setup code: the <span class="mono">STAFF_ADMIN_TOKEN</span> value from the server settings. This page closes once an administrator has a password.</p><form method="post" action="/admin/setup"><label for="code">Setup code</label><input id="code" name="code" type="password" required autocomplete="off"><label for="email">Your work email</label><input id="email" name="email" type="email" required autocomplete="username" value="${e(values.email)}"><label for="password">Choose a password</label><input id="password" name="password" type="password" required minlength="10" autocomplete="new-password">${passwordRules}<label for="confirm">Type it again</label><input id="confirm" name="confirm" type="password" required minlength="10" autocomplete="new-password"><button class="wide">Create administrator and sign in</button></form>`);
+}
+
+export function forgotHtml(flash: Flash, options: { emailEnabled: boolean; sent?: boolean }): string {
+  if (options.sent) return consoleLayout("Forgot password", null, flash, `<h1>Check your email</h1><p class="sub">If that address belongs to a staff account, we've sent a link to choose a new password. It expires in 24 hours.</p><p class="aside"><a href="/admin/login">Back to sign in</a></p>`);
+  if (!options.emailEnabled) return consoleLayout("Forgot password", null, flash, `<h1>Forgot your password?</h1><p class="sub">Ask an administrator for a password reset link. They can create one from <b>Staff</b> in the console and send it to you.</p><p class="aside"><a href="/admin/login">Back to sign in</a></p>`);
+  return consoleLayout("Forgot password", null, flash, `<h1>Forgot your password?</h1><p class="sub">Enter your work email and we'll send you a link to choose a new one.</p><form method="post" action="/admin/forgot"><label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="username"><button class="wide">Send reset link</button></form><p class="aside"><a href="/admin/login">Back to sign in</a></p>`);
+}
+
+export function choosePasswordHtml(flash: Flash, token: string, link: { email: string; purpose: "invite" | "reset" } | null): string {
+  if (!link) return consoleLayout("Choose a password", null, flash, `<h1>This link has expired</h1><p class="sub">Password links work once and expire. Ask an administrator for a new one.</p><p class="aside"><a href="/admin/login">Back to sign in</a></p>`);
+  const invite = link.purpose === "invite";
+  return consoleLayout("Choose a password", null, flash, `<h1>${invite ? "Welcome aboard" : "Choose a new password"}</h1><p class="sub">${invite ? "You've been invited to the Gratitude Stories staff console as" : "For"} <b>${e(link.email)}</b>.</p><form method="post" action="/admin/password/${encodeURIComponent(token)}"><input type="hidden" name="username" value="${e(link.email)}" autocomplete="username"><label for="password">${invite ? "Choose a password" : "New password"}</label><input id="password" name="password" type="password" required minlength="10" autocomplete="new-password" autofocus>${passwordRules}<label for="confirm">Type it again</label><input id="confirm" name="confirm" type="password" required minlength="10" autocomplete="new-password"><button class="wide">${invite ? "Create my account" : "Save and sign in"}</button></form>`);
+}
+
+export function accountHtml(identity: ConsoleIdentity, flash: Flash): string {
+  return consoleLayout("Your account", identity, flash, `<h1>Your account</h1><p class="sub">${e(identity.actor)} · ${identity.role === "admin" ? "Administrator" : "Operations"}</p><div class="panel" style="max-width:520px"><h2>Change your password</h2><form method="post" action="/admin/account/password"><input type="hidden" name="username" value="${e(identity.actor)}" autocomplete="username"><label for="current">Current password</label><input id="current" name="current" type="password" required autocomplete="current-password"><label for="password">New password</label><input id="password" name="password" type="password" required minlength="10" autocomplete="new-password">${passwordRules}<label for="confirm">Type it again</label><input id="confirm" name="confirm" type="password" required minlength="10" autocomplete="new-password"><button>Change password</button></form><p class="muted">Changing it signs you out on every other device.</p></div>`);
 }

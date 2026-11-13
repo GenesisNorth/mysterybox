@@ -13,6 +13,7 @@ import type { DeliverableReminder, ReminderDeliveryStore } from "../application/
 import type { MyStoriesRepository, StorySummary } from "../application/my-stories.js";
 import type { ErasureSubject, PrivacyRepository, PurgeResult } from "../application/privacy.js";
 import type { StartAGiftRepository } from "../application/start-a-gift.js";
+import type { PasswordLinkPurpose, StaffAccountsRepository, StaffLoginRecord } from "../application/staff-accounts.js";
 import { emptyPipeline, type AnalyticsRepository, type DashboardAnalytics } from "../application/analytics.js";
 import type { HelpCategory, HelpRequestSummary, PassForwardReminderStatus, ReminderChannel, ReminderLink, StaffReminder, SupportRepository } from "../application/support.js";
 
@@ -23,7 +24,7 @@ type BoxRow = {
 };
 type MemberRow = { position: number; first_name: string | null; last_initial: string | null; area: string | null; display_consent: boolean | null };
 
-export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository, AnalyticsRepository, StartAGiftRepository {
+export class PostgresRecipientJourneyRepository implements RecipientJourneyRepository, PassItForwardRepository, PaymentConfirmationStore, FulfilmentRepository, GiverTrackerRepository, StaffOperationsRepository, ReminderDeliveryStore, MyStoriesRepository, SupportRepository, PrivacyRepository, AnalyticsRepository, StartAGiftRepository, StaffAccountsRepository {
   constructor(private readonly pool: ActorAwarePool, private readonly passOnAmountKobo: number, private readonly starterAmountKobo: number = passOnAmountKobo) {}
 
   async ping(): Promise<void> { await this.pool.query("SELECT 1"); }
@@ -370,8 +371,8 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
   }
   async listRecentStaffBoxes(limit: number): Promise<StaffBoxOverview[]> { return this.searchStaffBoxes("", limit); }
   async createStaffUser(user: ProvisionedStaffUser): Promise<void> { await this.pool.query(`INSERT INTO staff_users (email,role,api_token_hash) VALUES ($1,$2,$3)`,[user.email,user.role,hashOpaqueToken(user.apiToken)]); }
-  async revokeStaffUser(email: string): Promise<boolean> { const result=await this.pool.query(`UPDATE staff_users SET active=false,revoked_at=now() WHERE email=$1 AND active=true AND revoked_at IS NULL`,[email]); return result.rowCount===1; }
-  async listStaffUsers(): Promise<StaffUserSummary[]> { const q=await this.pool.query<{email:string;role:StaffRole;active:boolean;created_at:Date;revoked_at:Date|null}>(`SELECT email,role,active,created_at,revoked_at FROM staff_users ORDER BY created_at DESC`); return q.rows.map(r=>({email:r.email,role:r.role,active:r.active,createdAt:r.created_at,revokedAt:r.revoked_at})); }
+  async revokeStaffUser(email: string): Promise<boolean> { const result=await this.pool.query<{id:string}>(`UPDATE staff_users SET active=false,revoked_at=now() WHERE email=$1 AND active=true AND revoked_at IS NULL RETURNING id`,[email]); const revoked=result.rows[0]; if (!revoked) return false; await this.pool.query(`UPDATE staff_sessions SET revoked_at=now() WHERE staff_user_id=$1 AND revoked_at IS NULL`,[revoked.id]); return true; }
+  async listStaffUsers(): Promise<StaffUserSummary[]> { const q=await this.pool.query<{email:string;role:StaffRole;active:boolean;created_at:Date;revoked_at:Date|null;password_set:boolean;last_login_at:Date|null}>(`SELECT email,role,active,created_at,revoked_at,password_hash IS NOT NULL AS password_set,last_login_at FROM staff_users ORDER BY created_at DESC`); return q.rows.map(r=>({email:r.email,role:r.role,active:r.active,createdAt:r.created_at,revokedAt:r.revoked_at,passwordSet:r.password_set,lastLoginAt:r.last_login_at})); }
   async rotateStaffUserToken(email: string, apiToken: string): Promise<StaffRole | null> { const q=await this.pool.query<{role:StaffRole}>(`UPDATE staff_users SET api_token_hash=$2 WHERE email=$1 AND active=true AND revoked_at IS NULL RETURNING role`,[email,hashOpaqueToken(apiToken)]); return q.rows[0]?.role ?? null; }
   async updateStaffRole(email: string, role: StaffRole): Promise<boolean> { const q=await this.pool.query(`UPDATE staff_users SET role=$2 WHERE email=$1 AND active=true AND revoked_at IS NULL`,[email,role]); return q.rowCount===1; }
   async isLastActiveAdmin(email: string): Promise<boolean> { const q=await this.pool.query<{target_admin:boolean;admin_count:string}>(`SELECT EXISTS(SELECT 1 FROM staff_users WHERE email=$1 AND role='admin' AND active=true AND revoked_at IS NULL) target_admin, (SELECT count(*) FROM staff_users WHERE role='admin' AND active=true AND revoked_at IS NULL) admin_count`,[email]); const r=q.rows[0]; return r ? r.target_admin && Number(r.admin_count) <= 1 : false; }
@@ -482,6 +483,95 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       await client.query("COMMIT"); return true;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
+  // --- Staff sign-in: passwords, sessions and one-time password links ---
+  async findActiveStaffForLogin(email: string): Promise<StaffLoginRecord | null> {
+    const row = (await this.pool.query<{ id: string; email: string; role: StaffRole; password_hash: string | null; failed_logins: number; locked_until: Date | null }>(`
+      SELECT id, email, role, password_hash, failed_logins, locked_until FROM staff_users WHERE email = $1 AND active = true AND revoked_at IS NULL`, [email])).rows[0];
+    return row ? { id: row.id, email: row.email, role: row.role, passwordHash: row.password_hash, failedLogins: row.failed_logins, lockedUntil: row.locked_until } : null;
+  }
+  async recordFailedLogin(staffId: string, lockUntil: Date | null): Promise<void> {
+    await this.pool.query(`UPDATE staff_users SET failed_logins = CASE WHEN locked_until IS NOT NULL AND locked_until <= now() THEN 1 ELSE failed_logins + 1 END,
+      locked_until = COALESCE($2, CASE WHEN locked_until <= now() THEN NULL ELSE locked_until END) WHERE id = $1`, [staffId, lockUntil]);
+    if (lockUntil) await this.pool.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) SELECT email, 'staff.locked', 'staff_users', id::text, '{}'::jsonb FROM staff_users WHERE id = $1`, [staffId]);
+  }
+  async recordSuccessfulLogin(staffId: string): Promise<void> {
+    await this.pool.query(`UPDATE staff_users SET failed_logins = 0, locked_until = NULL, last_login_at = now() WHERE id = $1`, [staffId]);
+  }
+  async createStaffSession(staffId: string, tokenHash: string, expiresAt: Date): Promise<void> {
+    await this.pool.query(`INSERT INTO staff_sessions (staff_user_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [staffId, tokenHash, expiresAt]);
+  }
+  async findStaffSession(tokenHash: string): Promise<{ staffId: string; actor: string; role: StaffRole } | null> {
+    const row = (await this.pool.query<{ id: string; email: string; role: StaffRole }>(`
+      SELECT u.id, u.email, u.role FROM staff_sessions s JOIN staff_users u ON u.id = s.staff_user_id
+      WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now() AND u.active = true AND u.revoked_at IS NULL`, [tokenHash])).rows[0];
+    return row ? { staffId: row.id, actor: row.email, role: row.role } : null;
+  }
+  async revokeStaffSession(tokenHash: string): Promise<void> { await this.pool.query(`UPDATE staff_sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`, [tokenHash]); }
+  async revokeStaffSessions(staffId: string, keepTokenHash?: string): Promise<void> {
+    await this.pool.query(`UPDATE staff_sessions SET revoked_at = now() WHERE staff_user_id = $1 AND revoked_at IS NULL AND token_hash IS DISTINCT FROM $2`, [staffId, keepTokenHash ?? null]);
+  }
+  async createPasswordLink(email: string, tokenHash: string, purpose: PasswordLinkPurpose, createdBy: string, expiresAt: Date): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const user = (await client.query<{ id: string }>(`SELECT id FROM staff_users WHERE email = $1 AND active = true AND revoked_at IS NULL FOR UPDATE`, [email])).rows[0];
+      if (!user) { await client.query("ROLLBACK"); return false; }
+      // Only the newest link works: issuing a new one retires any earlier unused link for this person.
+      await client.query(`UPDATE staff_password_links SET used_at = now() WHERE staff_user_id = $1 AND used_at IS NULL`, [user.id]);
+      await client.query(`INSERT INTO staff_password_links (staff_user_id, token_hash, purpose, created_by, expires_at) VALUES ($1, $2, $3, $4, $5)`, [user.id, tokenHash, purpose, createdBy, expiresAt]);
+      await client.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) VALUES ($1, $2, 'staff_users', $3, '{}'::jsonb)`, [createdBy, `staff.${purpose}_link`, user.id]);
+      await client.query("COMMIT"); return true;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async findPasswordLink(tokenHash: string): Promise<{ email: string; purpose: PasswordLinkPurpose } | null> {
+    const row = (await this.pool.query<{ email: string; purpose: PasswordLinkPurpose }>(`
+      SELECT u.email, l.purpose FROM staff_password_links l JOIN staff_users u ON u.id = l.staff_user_id
+      WHERE l.token_hash = $1 AND l.used_at IS NULL AND l.expires_at > now() AND u.active = true AND u.revoked_at IS NULL`, [tokenHash])).rows[0];
+    return row ?? null;
+  }
+  async setPasswordWithLink(tokenHash: string, passwordHash: string): Promise<{ staffId: string; email: string; role: StaffRole } | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const link = (await client.query<{ staff_user_id: string; email: string; role: StaffRole; purpose: string }>(`
+        UPDATE staff_password_links l SET used_at = now() FROM staff_users u
+        WHERE l.token_hash = $1 AND l.used_at IS NULL AND l.expires_at > now() AND u.id = l.staff_user_id AND u.active = true AND u.revoked_at IS NULL
+        RETURNING l.staff_user_id, u.email, u.role, l.purpose`, [tokenHash])).rows[0];
+      if (!link) { await client.query("ROLLBACK"); return null; }
+      await client.query(`UPDATE staff_users SET password_hash = $2, password_set_at = now(), failed_logins = 0, locked_until = NULL WHERE id = $1`, [link.staff_user_id, passwordHash]);
+      await client.query(`UPDATE staff_sessions SET revoked_at = now() WHERE staff_user_id = $1 AND revoked_at IS NULL`, [link.staff_user_id]);
+      await client.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) VALUES ($1, 'staff.password_set', 'staff_users', $2, $3)`, [link.email, link.staff_user_id, JSON.stringify({ via: link.purpose })]);
+      await client.query("COMMIT");
+      return { staffId: link.staff_user_id, email: link.email, role: link.role };
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async setPassword(staffId: string, passwordHash: string): Promise<void> {
+    await this.pool.query(`UPDATE staff_users SET password_hash = $2, password_set_at = now(), failed_logins = 0, locked_until = NULL WHERE id = $1`, [staffId, passwordHash]);
+    await this.pool.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) SELECT email, 'staff.password_changed', 'staff_users', id::text, '{}'::jsonb FROM staff_users WHERE id = $1`, [staffId]);
+  }
+  async passwordHashFor(staffId: string): Promise<string | null> {
+    return (await this.pool.query<{ password_hash: string | null }>(`SELECT password_hash FROM staff_users WHERE id = $1`, [staffId])).rows[0]?.password_hash ?? null;
+  }
+  async needsFirstAdministrator(): Promise<boolean> {
+    const row = (await this.pool.query<{ exists: boolean }>(`SELECT EXISTS (SELECT 1 FROM staff_users WHERE role = 'admin' AND active = true AND revoked_at IS NULL AND password_hash IS NOT NULL) AS exists`)).rows[0];
+    return !row?.exists;
+  }
+  async createFirstAdministrator(email: string, passwordHash: string, apiTokenHash: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Serialise concurrent setups, then re-check under the lock.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('staff-first-administrator'))`);
+      const done = (await client.query(`SELECT 1 FROM staff_users WHERE role = 'admin' AND active = true AND revoked_at IS NULL AND password_hash IS NOT NULL`)).rowCount;
+      if (done) { await client.query("ROLLBACK"); return false; }
+      await client.query(`
+        INSERT INTO staff_users (email, role, api_token_hash, password_hash, password_set_at) VALUES ($1, 'admin', $2, $3, now())
+        ON CONFLICT (email) DO UPDATE SET role = 'admin', active = true, revoked_at = NULL, password_hash = EXCLUDED.password_hash, password_set_at = now(), failed_logins = 0, locked_until = NULL`, [email, apiTokenHash, passwordHash]);
+      await client.query(`INSERT INTO staff_audit_events (actor, action, target_type, target_id, metadata) VALUES ($1, 'staff.first_administrator', 'staff_users', $1, '{}'::jsonb)`, [email]);
+      await client.query("COMMIT"); return true;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
   // --- Dashboard analytics (aggregates only; no personal data) ---
   async dashboardAnalytics(): Promise<DashboardAnalytics> {
     const one = async <T>(sql: string): Promise<T> => (await this.pool.query(sql)).rows[0] as T;
@@ -546,7 +636,9 @@ export class PostgresRecipientJourneyRepository implements RecipientJourneyRepos
       storySessions: await run(`DELETE FROM story_sessions WHERE expires_at < ${before}`),
       storyLinks: await run(`DELETE FROM story_magic_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`),
       referrals: await run(`DELETE FROM referrals r WHERE r.expires_at < ${before} AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.referral_id = r.id)`),
-      recoveryLinks: await run(`DELETE FROM holder_recovery_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`)
+      recoveryLinks: await run(`DELETE FROM holder_recovery_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`),
+      staffSessions: await run(`DELETE FROM staff_sessions WHERE expires_at < ${before} OR (revoked_at IS NOT NULL AND revoked_at < ${before})`),
+      staffPasswordLinks: await run(`DELETE FROM staff_password_links WHERE expires_at < ${before} OR (used_at IS NOT NULL AND used_at < ${before})`)
     };
   }
   async erasePersonalData(boxNumber: string, subject: ErasureSubject, actor: string): Promise<boolean> {

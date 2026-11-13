@@ -8,6 +8,11 @@ test("development never blocks startup", () => assert.deepEqual(productionConfig
 test("a complete production configuration passes", () => assert.deepEqual(productionConfigProblems(good), []));
 test("every production problem is reported at once", () => {
   const problems = productionConfigProblems({ NODE_ENV: "production", PASS_ON_AMOUNT_KOBO: "15000.50", PUBLIC_BASE_URL: "http://gratitude.example/app", METRICS_TOKEN: "short" });
-  for (const pattern of [/DATABASE_URL/, /PASS_ON_AMOUNT_KOBO/, /https:\/\//, /no path/, /METRICS_TOKEN/, /STAFF_ADMIN_TOKEN is required/]) assert.ok(problems.some((problem) => pattern.test(problem)), pattern.source);
+  for (const pattern of [/DATABASE_URL/, /PASS_ON_AMOUNT_KOBO/, /https:\/\//, /no path/, /METRICS_TOKEN/]) assert.ok(problems.some((problem) => pattern.test(problem)), pattern.source);
 });
 test("short staff tokens are refused", () => assert.match(productionConfigProblems({ ...good, STAFF_OPERATIONS_TOKEN: "ops123" })[0] ?? "", /at least 32/));
+
+test("the setup code is optional, so it can be removed once the first administrator exists", () => {
+  const { STAFF_ADMIN_TOKEN: _removed, ...withoutSetupCode } = good;
+  assert.deepEqual(productionConfigProblems(withoutSetupCode), []);
+});

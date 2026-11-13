@@ -290,3 +290,34 @@ test("a paid starter order creates a new trail and its first box, with the story
   assert.equal(await repo.createPendingStarterOrder(token, normalizeCheckout(checkout())), null, "a paid order is closed to further checkouts");
   await assert.rejects(() => q(`INSERT INTO orders (kind, reference, amount_kobo, customer_email, status, parent_box_id) VALUES ('starter', $1, 100, 'a@b.co', 'pending_payment', $2)`, [`ORD-${unique()}`, paid.childBoxId]), /orders_kind_shape/);
 });
+
+test("staff sign in with email and password: lockout, one-time links, sessions ended by password changes and revocation", { skip }, async () => {
+  const { q, repo } = db();
+  const { StaffAccounts } = await import("../application/staff-accounts.js");
+  const { StaffOperations } = await import("../application/staff-operations.js");
+  const accounts = new StaffAccounts(repo, undefined);
+  const email = `staff-${unique().toLowerCase()}@example.com`;
+  await new StaffOperations(repo).provisionStaffUser(email, "operations");
+  await assert.rejects(() => accounts.signIn(email, "anything at all"), /don't match/, "no password until the invite is used");
+  const invite = (await accounts.issuePasswordLink(email, "invite", "admin@example.com"))!;
+  assert.deepEqual(await accounts.passwordLink(invite), { email, purpose: "invite" });
+  const first = await accounts.completePasswordLink(invite, "green boxes travel far", "green boxes travel far");
+  assert.deepEqual(await accounts.identify(first.sessionToken), { actor: email, role: "operations" });
+  assert.equal(await accounts.passwordLink(invite), null, "the invite works once");
+  const stored = (await q(`SELECT password_hash FROM staff_users WHERE email = $1`, [email])).rows[0].password_hash as string;
+  assert.match(stored, /^scrypt\$16384\$8\$1\$/); assert.ok(!stored.includes("green"), "only a hash is stored");
+
+  for (let i = 0; i < 5; i++) await assert.rejects(() => accounts.signIn(email, "wrong password!"));
+  await assert.rejects(() => accounts.signIn(email, "green boxes travel far"), /Too many attempts/);
+  const reset = (await accounts.issuePasswordLink(email, "reset", "admin@example.com"))!;
+  await accounts.completePasswordLink(reset, "a fresh new phrase", "a fresh new phrase");
+  assert.equal(await accounts.identify(first.sessionToken), null, "a reset ends earlier sessions");
+  const second = await accounts.signIn(email, "a fresh new phrase");
+  assert.ok(await accounts.identify(second.sessionToken), "a reset also clears the lockout");
+  const audit = (await q(`SELECT action FROM staff_audit_events WHERE target_type = 'staff_users' AND target_id = (SELECT id::text FROM staff_users WHERE email = $1) ORDER BY occurred_at`, [email])).rows.map((row) => row.action);
+  assert.deepEqual(audit.filter((action) => action.startsWith("staff.")), ["staff.invite_link", "staff.password_set", "staff.locked", "staff.reset_link", "staff.password_set"]);
+
+  await new StaffOperations(repo).revokeStaffUser(email);
+  assert.equal(await accounts.identify(second.sessionToken), null, "revoking access signs the person out everywhere");
+  assert.equal(await accounts.issuePasswordLink(email, "reset", "admin@example.com"), null);
+});
